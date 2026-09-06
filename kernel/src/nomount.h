@@ -35,7 +35,7 @@
 #define nm_err(fmt, ...)  printk(KERN_ERR "NoMount: [ERROR] " fmt, ##__VA_ARGS__)
 
 static struct rb_root_cached nomount_rules_tree = RB_ROOT_CACHED;
-struct nm_uid_array __rcu *nomount_uids = NULL;
+extern struct nm_uid_array __rcu *nomount_uids;
 static LIST_HEAD(nomount_sb_list);
 static DECLARE_RWSEM(nomount_rwsem);
 DEFINE_STATIC_SRCU(nomount_srcu);
@@ -149,33 +149,63 @@ static inline int nm_uid_add(uid_t target)
 {
     struct nm_uid_array *old, *new_arr;
     int count = 0;
-    if ((old = rcu_dereference_protected(nomount_uids, lockdep_is_held(&nomount_rwsem)))) {
-        for (int i = 0; i < (count = old->count); i++) if (old->uids[i] == target) return -EEXIST;
+
+    old = rcu_dereference_protected(nomount_uids, lockdep_is_held(&nomount_rwsem));
+    if (old) {
+        count = old->count;
+        for (int i = 0; i < count; i++) {
+            if (old->uids[i] == target)
+                return -EEXIST;
+        }
     }
 
-    if (!(new_arr = kmalloc(sizeof(*new_arr) + (count + 1) * sizeof(uid_t), GFP_KERNEL))) return -ENOMEM;
+    new_arr = kmalloc(sizeof(*new_arr) + (count + 1) * sizeof(uid_t), GFP_KERNEL);
+    if (!new_arr)
+        return -ENOMEM;
+
     new_arr->count = count + 1;
-    if (old) memcpy(new_arr->uids, old->uids, count * sizeof(uid_t));
+    if (old && count > 0)
+        memcpy(new_arr->uids, old->uids, count * sizeof(uid_t));
+
     new_arr->uids[count] = target;
     rcu_assign_pointer(nomount_uids, new_arr);
-    if (old) kfree_rcu(old, rcu);
+
+    if (old)
+        kfree_rcu(old, rcu);
     return 0;
 }
 
 static inline int nm_uid_del(uid_t target)
 {
     struct nm_uid_array *old, *new_arr = NULL;
-    int count, found = 0, j = 0;
+    int count, target_idx = -1;
 
-    if (!(old = rcu_dereference_protected(nomount_uids, lockdep_is_held(&nomount_rwsem)))) return -ENOENT;
-    for (int i = 0; i < (count = old->count); i++) if (old->uids[i] == target) { found = 1; break; } 
-    if (!found) return -ENOENT;
+    old = rcu_dereference_protected(nomount_uids, lockdep_is_held(&nomount_rwsem));
+    if (!old)
+        return -ENOENT;
+
+    count = old->count;
+    for (int i = 0; i < count; i++) {
+        if (old->uids[i] == target) {
+            target_idx = i;
+            break;
+        }
+    }
+    if (target_idx < 0)
+        return -ENOENT;
 
     if (count > 1) {
-        if (!(new_arr = kmalloc(sizeof(*new_arr) + (count - 1) * sizeof(uid_t), GFP_KERNEL))) return -ENOMEM;
+        new_arr = kmalloc(sizeof(*new_arr) + (count - 1) * sizeof(uid_t), GFP_KERNEL);
+        if (!new_arr)
+            return -ENOMEM;
         new_arr->count = count - 1;
-        for (int i = 0; i < count; i++) if (old->uids[i] != target) new_arr->uids[j++] = old->uids[i];
+        if (target_idx > 0)
+            memcpy(new_arr->uids, old->uids, target_idx * sizeof(uid_t));
+        if (target_idx < count - 1)
+            memcpy(new_arr->uids + target_idx, old->uids + target_idx + 1,
+                   (count - target_idx - 1) * sizeof(uid_t));
     }
+
     rcu_assign_pointer(nomount_uids, new_arr);
     kfree_rcu(old, rcu);
     return 0;
@@ -184,7 +214,9 @@ static inline int nm_uid_del(uid_t target)
 static inline void nm_uid_clear(void)
 {
     struct nm_uid_array *old;
-    if ((old = rcu_dereference_protected(nomount_uids, lockdep_is_held(&nomount_rwsem)))) {
+
+    old = rcu_dereference_protected(nomount_uids, lockdep_is_held(&nomount_rwsem));
+    if (old) {
         RCU_INIT_POINTER(nomount_uids, NULL);
         kfree_rcu(old, rcu);
     }

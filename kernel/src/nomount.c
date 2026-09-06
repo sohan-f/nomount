@@ -7,6 +7,8 @@
 #include <linux/module.h>
 #include "nomount.h"
 
+struct nm_uid_array __rcu *nomount_uids = NULL;
+
 /*** Helpers ***/
 
 static __always_inline bool nomount_is_uid_blocked(uid_t target_uid)
@@ -55,7 +57,7 @@ static bool __nomount_get_rule_info(struct nomount_dir_node *dir_node, const cha
     struct nomount_child_array *arr;
     struct nomount_rule *rule, *found_rule;
     unsigned int seq;
-    uid_t fsuid = current_uid().val;
+    uid_t fsuid = current_fsuid().val;
 
     do {
         found_rule = NULL;
@@ -185,7 +187,7 @@ static NM_ACTOR_RET nomount_actor_proxy(struct dir_context *ctx, const char *nam
 static inline void nomount_emit_virtual_children(struct dir_context *ctx, struct nomount_dir_node *dir_node)
 {
 	struct nomount_child_array *array;
-	uid_t fsuid = current_uid().val;
+	uid_t fsuid = current_fsuid().val;
 	int id, srcu_idx;
 
 	if (!dir_node || nomount_is_uid_blocked(fsuid)) return;
@@ -249,6 +251,7 @@ static struct dentry *nomount_resolve_rule_dentry(struct inode *dir, struct dent
     struct inode *splice_inode = NULL, *prealloc_inode = NULL;
     struct dentry *res = ERR_PTR(-ENODATA);
     struct nm_rule_info rule_info = {0};
+    uid_t fsuid = current_fsuid().val;
 
     rcu_read_lock();
     if (!dir_node || !__nomount_get_rule_info(dir_node, dentry->d_name.name, dentry->d_name.len, hash, &rule_info, false))
@@ -269,8 +272,7 @@ static struct dentry *nomount_resolve_rule_dentry(struct inode *dir, struct dent
         goto unlock_out;
 
 resolve_rule:
-    if (unlikely(nomount_is_uid_blocked(current_uid().val))) {
-        if (d_is_negative(dentry)) d_drop(dentry);
+    if (unlikely(nomount_is_uid_blocked(fsuid))) {
         goto unlock_out;
     }
 
@@ -319,8 +321,12 @@ static struct dentry *nomount_hijacked_lookup(struct inode *dir, struct dentry *
     struct nomount_dir_node *dir_node = nm_iop ? READ_ONCE(nm_iop->dir_node) : NULL;
     struct dentry *res;
     u32 hash = 0;
+    uid_t fsuid = current_fsuid().val;
 
     if (unlikely(!nm_iop || !dir_node))
+        goto do_real_lookup;
+
+    if (nomount_is_uid_blocked(fsuid))
         goto do_real_lookup;
 
     hash = full_name_hash((const void *)(unsigned long)NOMOUNT_MAGIC_SIG, dentry->d_name.name, dentry->d_name.len);
@@ -333,9 +339,14 @@ static struct dentry *nomount_hijacked_lookup(struct inode *dir, struct dentry *
 do_real_lookup:
     if (likely(nm_iop && nm_iop->orig_iop && nm_iop->orig_iop->lookup)) {
         res = nm_iop->orig_iop->lookup(dir, dentry, flags);
-        if (unlikely(nomount_get_rule_info(dir_node, dentry->d_name.name, dentry->d_name.len, hash, NULL, false))) {
-            struct dentry *target = res ? res : dentry;
-            if (!IS_ERR(target)) d_drop(target);
+        if (dir_node) {
+            if (!hash)
+                hash = full_name_hash((const void *)(unsigned long)NOMOUNT_MAGIC_SIG, dentry->d_name.name, dentry->d_name.len);
+            if (unlikely(nomount_get_rule_info(dir_node, dentry->d_name.name, dentry->d_name.len, hash, NULL, false))) {
+                struct dentry *target = res ? res : dentry;
+                if (!IS_ERR(target))
+                    d_drop(target);
+            }
         }
         return res;
     }
@@ -731,6 +742,7 @@ static int nm_d_revalidate(struct dentry *dentry, unsigned int flags)
     struct inode *inode;
     struct nm_iop *iop = NULL;
     bool injected, has_rule = false;
+    uid_t fsuid = current_fsuid().val;
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 13, 0)
     struct inode *parent_inode = d_inode(READ_ONCE(dentry->d_parent));
@@ -753,7 +765,20 @@ static int nm_d_revalidate(struct dentry *dentry, unsigned int flags)
         has_rule = nomount_get_rule_info(parent_dir, name->name, name->len, hash, &rule_info, false);
     }
 
-    if (has_rule && !nomount_is_uid_blocked(current_uid().val)) {
+    if (nomount_is_uid_blocked(fsuid)) {
+        if (injected)
+            goto drop_it;
+        if ((orig_dops = nm_get_orig_dops(iop)) && orig_dops->d_revalidate) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+            return orig_dops->d_revalidate(parent_inode, name, dentry, flags);
+#else
+            return orig_dops->d_revalidate(dentry, flags);
+#endif
+        }
+        return 1;
+    }
+
+    if (has_rule) {
         if (rule_info.flags & NM_FLAG_WHITEOUT) return !inode;
         if (injected) return 1;
         goto drop_it;
@@ -1364,8 +1389,8 @@ static void __nomount_clear_all(int clear_flags)
     HLIST_HEAD(r_victims);
 
     if (clear_flags & NM_CLEAR_UIDS) {
-        synchronize_rcu();
         nm_uid_clear();
+        synchronize_rcu();
     }
     if (clear_flags & NM_CLEAR_RULES) {
         struct rb_node *node;
@@ -1498,9 +1523,16 @@ static int nm_process_payload(unsigned long user_addr)
             u32 *out = (u32 *)payload->buffer;
             int count = 0, start_idx = payload->arg1;
             struct nm_uid_array *arr;
+
+            if (start_idx < 0) {
+                payload->status = -EINVAL;
+                break;
+            }
+
             rcu_read_lock();
             if ((arr = rcu_dereference(nomount_uids))) {
-                while (start_idx < arr->count && count < (sizeof(payload->buffer) / sizeof(*out)))
+                int total_uids = READ_ONCE(arr->count);
+                while (start_idx < total_uids && count < (sizeof(payload->buffer) / sizeof(*out)))
                     out[count++] = arr->uids[start_idx++];
             }
             rcu_read_unlock();            
