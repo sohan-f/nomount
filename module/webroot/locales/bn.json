@@ -36,9 +36,9 @@
   "modules_hot_load": "হট লোড",
   "modules_hot_unload": "হট আনলোড",
   "unknown_value": "অজানা",
-  "cancel": "Cancel",
-  "add": "Add",
-  "enter_manual_uid": "Enter UID manually",
+  "cancel": "বাতিল",
+  "add": "যোগ করুন",
+  "enter_manual_uid": "ম্যানুয়ালি UID লিখুন",
   "invalid_uid": "অকার্যকর UID",
   "unblocking_name": "{{name}} আনব্লক করা হচ্ছে...",
   "blocked_saved": "সংরক্ষিত; রানটাইম ব্লক ব্যর্থ হয়েছে",
@@ -56,5 +56,5 @@
   "add_exclusion": "ব্যতিক্রম যোগ করুন",
   "mode_lkm": "LKM",
   "mode_builtin": "বিল্ট-ইন",
-  "module_version_label": "Module version"
+  "module_version_label": "মডিউল সংস্করণ"
 }
