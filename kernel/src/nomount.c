@@ -5,11 +5,16 @@
 #include <linux/cred.h>
 #include <linux/xattr.h>
 #include <linux/module.h>
+#include <linux/magic.h>
+#include <uapi/linux/f2fs.h>
 #include "nomount.h"
 
 /*** Helpers ***/
 
 static bool nm_block_isolated_uids = false;
+static bool nm_shutdown_started;
+
+static void nm_clear_rules_for_f2fs_shutdown(void);
 static __always_inline bool nomount_is_uid_blocked(uid_t target_uid)
 {
     struct nm_uid_array *arr;
@@ -525,6 +530,90 @@ static long nm_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned long
     return real_file->f_op->unlocked_ioctl(real_file, cmd, arg);
 }
 
+static const struct file_operations *nm_original_fops(const struct file_operations *fops)
+{
+    for (int depth = 0; fops && depth < 4; depth++) {
+        struct nm_dir_ops *dir_ops = nm_get_nm_fop(fops);
+        if (dir_ops) {
+            fops = dir_ops->orig_fop;
+            continue;
+        }
+        if (fops->unlocked_ioctl == nomount_root_unlocked_ioctl) {
+            struct nm_sop *nm_sop = container_of(fops, struct nm_sop, fake_root_fop);
+            fops = nm_sop->orig_root_fop;
+            continue;
+        }
+        break;
+    }
+    return fops;
+}
+
+static long nm_call_hijacked_ioctl(struct file *file, unsigned int cmd, unsigned long arg,
+                                   bool compat)
+{
+    const struct file_operations *orig = nm_original_fops(file->f_op);
+    long (*ioctl_fn)(struct file *, unsigned int, unsigned long);
+
+    if (cmd == F2FS_IOC_SHUTDOWN && file_inode(file)->i_sb->s_magic == F2FS_SUPER_MAGIC) {
+        nm_clear_rules_for_f2fs_shutdown();
+    }
+
+    if (compat)
+        ioctl_fn = orig ? orig->compat_ioctl : NULL;
+    else
+        ioctl_fn = orig ? orig->unlocked_ioctl : NULL;
+    return ioctl_fn ? ioctl_fn(file, cmd, arg) : -ENOTTY;
+}
+
+static long nomount_root_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    const struct file_operations *orig = nm_original_fops(file->f_op);
+    long (*ioctl_fn)(struct file *, unsigned int, unsigned long) =
+        orig ? orig->unlocked_ioctl : NULL;
+
+    if (cmd == F2FS_IOC_SHUTDOWN && file_inode(file)->i_sb->s_magic == F2FS_SUPER_MAGIC) {
+        nm_clear_rules_for_f2fs_shutdown();
+    }
+    return ioctl_fn ? ioctl_fn(file, cmd, arg) : -ENOTTY;
+}
+
+#ifdef CONFIG_COMPAT
+static long nomount_root_compat_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    const struct file_operations *orig = nm_original_fops(file->f_op);
+    long (*ioctl_fn)(struct file *, unsigned int, unsigned long) =
+        orig ? orig->compat_ioctl : NULL;
+
+    if (cmd == F2FS_IOC_SHUTDOWN && file_inode(file)->i_sb->s_magic == F2FS_SUPER_MAGIC) {
+        nm_clear_rules_for_f2fs_shutdown();
+    }
+    return ioctl_fn ? ioctl_fn(file, cmd, arg) : -ENOTTY;
+}
+#endif
+
+static long nomount_hijacked_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    return nm_call_hijacked_ioctl(file, cmd, arg, false);
+}
+
+#ifdef CONFIG_COMPAT
+static long nomount_hijacked_compat_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    return nm_call_hijacked_ioctl(file, cmd, arg, true);
+}
+#endif
+
+static void nomount_f2fs_umount_begin(struct super_block *sb)
+{
+    struct nm_sop *nm_sop = nm_get_nm_sop(READ_ONCE(sb->s_op));
+    void (*umount_begin)(struct super_block *) =
+        nm_sop && nm_sop->orig_sop ? nm_sop->orig_sop->umount_begin : NULL;
+
+    /* Android's last-resort umount is forced and precedes F2FS_IOC_SHUTDOWN. */
+    nm_clear_rules_for_f2fs_shutdown();
+    if (umount_begin) umount_begin(sb);
+}
+
 #ifdef CONFIG_COMPAT
 static long nm_compat_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
@@ -910,8 +999,13 @@ static inline int nomount_hijack_superblock(struct super_block *sb)
     nm_sop->orig_sop = sb->s_op;
     nm_sop->orig_xattr = nm_sop->fake_xattr = NULL;
     nm_sop->sb = sb;
+    nm_sop->root_inode = NULL;
+    nm_sop->orig_root_fop = NULL;
     nm_sop->fake_sop.drop_inode = nomount_hijacked_drop_inode;
     nm_sop->fake_sop.evict_inode = nomount_hijacked_evict_inode;
+
+    if (sb->s_magic == F2FS_SUPER_MAGIC)
+        nm_sop->fake_sop.umount_begin = nomount_f2fs_umount_begin;
 
     if (sb->s_xattr) {
         const struct xattr_handler **new_array;
@@ -938,6 +1032,23 @@ static inline int nomount_hijack_superblock(struct super_block *sb)
         nm_sop->fake_xattr = new_array;
         smp_store_release((const struct xattr_handler ***)&sb->s_xattr, new_array);
         nm_debug("xattr handlers successfully hijacked for dev: 0x%x\n", sb->s_dev);
+    }
+
+    if (sb->s_magic == F2FS_SUPER_MAGIC && sb->s_root) {
+        struct inode *root_inode = d_backing_inode(sb->s_root);
+        const struct file_operations *root_fop = root_inode ? READ_ONCE(root_inode->i_fop) : NULL;
+        if (root_fop && root_fop->unlocked_ioctl) {
+            nm_sop->root_inode = root_inode;
+            nm_sop->orig_root_fop = root_fop;
+            nm_sop->fake_root_fop = *root_fop;
+            nm_sop->fake_root_fop.owner = THIS_MODULE;
+            nm_sop->fake_root_fop.unlocked_ioctl = nomount_root_unlocked_ioctl;
+#ifdef CONFIG_COMPAT
+            if (root_fop->compat_ioctl)
+                nm_sop->fake_root_fop.compat_ioctl = nomount_root_compat_ioctl;
+#endif
+            smp_store_release(&root_inode->i_fop, &nm_sop->fake_root_fop);
+        }
     }
 
     list_add_tail_rcu(&nm_sop->list, &nomount_sb_list);
@@ -980,6 +1091,10 @@ static inline int nomount_hijack_dir_ops(struct nomount_dir_node *dir_node, stru
     if (fop) {
         ops->fake_fop = *fop;
         ops->fake_fop.owner = THIS_MODULE;
+        if (fop->unlocked_ioctl) ops->fake_fop.unlocked_ioctl = nomount_hijacked_unlocked_ioctl;
+#ifdef CONFIG_COMPAT
+        if (fop->compat_ioctl) ops->fake_fop.compat_ioctl = nomount_hijacked_compat_ioctl;
+#endif
         if (fop->iterate_shared) ops->fake_fop.iterate_shared = nomount_hijacked_iterate_dir;
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
         if (fop->iterate) ops->fake_fop.iterate = nomount_hijacked_iterate_dir;
@@ -1054,6 +1169,9 @@ static void nomount_restore_superblocks(void)
                 nm_destroy_hijacked_inode(inode);
             }
             spin_unlock(&nm_sop->sb->s_inode_list_lock);
+            if (nm_sop->root_inode &&
+                READ_ONCE(nm_sop->root_inode->i_fop) == &nm_sop->fake_root_fop)
+                smp_store_release(&nm_sop->root_inode->i_fop, nm_sop->orig_root_fop);
             smp_store_release(&nm_sop->sb->s_op, nm_sop->orig_sop);
             if (nm_sop->fake_xattr) {
                 smp_store_release((const struct xattr_handler ***)&nm_sop->sb->s_xattr, nm_sop->orig_xattr);
@@ -1190,6 +1308,12 @@ static int nm_prepare_rule(const char *r_path, u16 r_len, u32 flags, unsigned in
         if (err) { memset(out, 0, sizeof(*out)); return err; }
         struct inode *inode = d_backing_inode(out->r_path.dentry);
         if (inode && S_ISDIR(inode->i_mode)) out->flags |= NM_FLAG_IS_DIR;
+        if (out->r_path.dentry->d_sb->s_magic == F2FS_SUPER_MAGIC &&
+            (err = nomount_hijack_superblock(out->r_path.dentry->d_sb))) {
+            path_put(&out->r_path);
+            memset(out, 0, sizeof(*out));
+            return err;
+        }
     }
     return 0;
 }
@@ -1584,6 +1708,20 @@ static void __nomount_clear_all(int clear_flags)
     if (clear_flags & NM_CLEAR_EXIT) nomount_restore_superblocks();
 }
 
+static void nm_clear_rules_for_f2fs_shutdown(void)
+{
+    struct nm_sop *entry;
+
+    mutex_lock(&nomount_mutex);
+    WRITE_ONCE(nm_shutdown_started, true);
+    __nomount_clear_all(NM_CLEAR_RULES);
+    list_for_each_entry(entry, &nomount_sb_list, list)
+        if (entry->sb) shrink_dcache_sb(entry->sb);
+    mutex_unlock(&nomount_mutex);
+
+    rcu_barrier();
+}
+
 /*** Payload Communication API ***/
 
 static int nm_process_payload(unsigned long user_addr)
@@ -1615,6 +1753,11 @@ static int nm_process_payload(unsigned long user_addr)
             buf_ptr = payload->buffer + offset;
             buf_end = payload->buffer + data_size;
             mutex_lock(&nomount_mutex);
+            if (READ_ONCE(nm_shutdown_started)) {
+                payload->status = -ESHUTDOWN;
+                mutex_unlock(&nomount_mutex);
+                break;
+            }
             while (buf_ptr < buf_end) {
                 struct nm_rule_hdr h;
                 int err;

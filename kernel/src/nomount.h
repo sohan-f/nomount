@@ -65,6 +65,9 @@ struct nm_sop {
     const struct xattr_handler **orig_xattr;
     const struct xattr_handler **fake_xattr;
     struct super_block *sb;
+    struct inode *root_inode;
+    const struct file_operations *orig_root_fop;
+    struct file_operations fake_root_fop;
     struct rcu_head rcu;
     struct list_head list;
 };
@@ -181,6 +184,8 @@ static const struct dentry_operations nm_owned_dops;
 static struct dentry *nomount_hijacked_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags);
 static int nomount_hijacked_iterate_dir(struct file *file, struct dir_context *ctx);
 static void nomount_hijacked_evict_inode(struct inode *inode);
+static long nomount_root_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
+static long nomount_hijacked_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 static void nomount_hijack_dentry_ops(struct inode *dir, struct dentry *dentry, bool injected);
 static void nm_dir_put(struct nomount_dir_node *dir_node);
 
