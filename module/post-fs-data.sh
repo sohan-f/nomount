@@ -18,4 +18,9 @@ if ! ensure_lkm_loaded; then
 fi
 
 echo "[OK] Kernel API ready (post-fs-data)." >> "$LOG_FILE"
+
+# The daemon lives until reboot; stdio is detached or an inherited /data fd
+# would keep the umount EBUSY even after the rules clear.
+"$LOADER" reboot-watch </dev/null >/dev/null 2>&1 &
+
 exit 0

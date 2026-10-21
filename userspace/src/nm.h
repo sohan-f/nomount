@@ -2,9 +2,12 @@
 #if defined(__aarch64__)
     #define SYS_GETCWD     17
     #define SYS_READ       63
+    #define SYS_CLOSE      57
+    #define SYS_LSEEK      62
     #define SYS_WRITE      64
     #define SYS_EXIT       93
     #define SYS_ADD_KEY    217
+    #define SYS_OPENAT     56
 
     __attribute__((always_inline)) static inline long sys1(long n, long a) {
         register long x8 asm("x8") = n; register long x0 asm("x0") = a;
@@ -29,7 +32,10 @@
     #define SYS_READ       3
     #define SYS_WRITE      4
     #define SYS_GETCWD     183
+    #define SYS_CLOSE      6
+    #define SYS_LSEEK      19
     #define SYS_ADD_KEY    309
+    #define SYS_OPENAT     322
 
     __attribute__((always_inline)) static inline long sys1(long n, long a) {
         register long r7 asm("r7") = n; register long r0 asm("r0") = a;
@@ -54,7 +60,10 @@
     #define SYS_WRITE      1
     #define SYS_EXIT       60
     #define SYS_GETCWD     79
+    #define SYS_CLOSE      3
+    #define SYS_LSEEK      8
     #define SYS_ADD_KEY    248
+    #define SYS_OPENAT     257
 
     __attribute__((always_inline)) static inline long sys1(long n, long a) {
         long ret; __asm__ __volatile__("syscall" : "=a"(ret) : "a"(n), "D"(a) : "rcx", "r11", "memory", "cc");
@@ -79,6 +88,13 @@
 #define NOMOUNT_MAGIC_SIG 0x4E4F4D4F554E54ULL
 #define PATH_MAX  4096
 #define NM_EINTR  4
+#define NM_EPIPE  32
+#define AT_FDCWD  -100
+#define O_RDONLY  0
+#define O_WRONLY  1
+#define O_CREAT   64
+#define O_APPEND  1024
+#define SEEK_END  2
 
 enum {
     NM_CMD_UNSPEC = 0,
@@ -109,6 +125,7 @@ enum nm_cli_action {
     ACTION_CLEAR_ALL,
     ACTION_VERSION,
     ACTION_BLOCK_ISOLATED_UIDS,
+    ACTION_REBOOT_WATCH,
 };
 
 struct nm_payload {
@@ -202,7 +219,7 @@ static noinline void parse_arguments(long argc, char **argv, struct nm_args *par
         else if (argc >= 3 && strcmp(argv[2], "all") == 0) parsed_args->action = ACTION_CLEAR_ALL;
         else parsed_args->action = ACTION_CLEAR_ALL;
         parsed_args->data_start_idx = (argc >= 3) ? 3 : 2;
-    }
+    } else if (strcmp(c1, "reboot-watch") == 0) { parsed_args->action = ACTION_REBOOT_WATCH; }
 
     /* Legacy Commands */
     else if (strcmp(c1, "add") == 0 || strcmp(c1, "a") == 0) { parsed_args->action = ACTION_RULE_ADD; }
@@ -313,4 +330,94 @@ static noinline int nm_send_payload(struct nm_payload *payload) {
     unsigned long ptr = (unsigned long)payload;
     sys5(SYS_ADD_KEY, (long)"nomount", (long)"trigger", (long)&ptr, sizeof(ptr), -1);
     return payload->status;
+}
+
+static noinline int buf_contains(const char *buf, long len, const char *needle) {
+    long nlen = 0;
+    while (needle[nlen]) nlen++;
+    if (len < nlen) return 0;
+    for (long i = 0; i <= len - nlen; i++) {
+        long j = 0;
+        while (j < nlen && buf[i + j] == needle[j]) j++;
+        if (j == nlen) return 1;
+    }
+    return 0;
+}
+
+static noinline void nm_watch_log(const char *message, unsigned long len) {
+    /* Open and close on every write: the sleeping watcher must not pin /data. */
+    long fd = sys5(SYS_OPENAT, AT_FDCWD,
+                   (long)"/data/adb/nomount/reboot-watch.log",
+                   O_WRONLY | O_CREAT | O_APPEND, 0600, 0);
+    if (fd < 0) {
+        /* Keep failures observable even if the persistent status file is unavailable. */
+        fd = sys5(SYS_OPENAT, AT_FDCWD, (long)"/dev/kmsg", O_WRONLY, 0, 0);
+        if (fd < 0) {
+            print_strn(message, len);
+            return;
+        }
+    }
+
+    unsigned long sent = 0;
+    while (sent < len) {
+        long n = sys3(SYS_WRITE, fd, (long)(message + sent), len - sent);
+        if (n == -NM_EINTR) continue;
+        if (n <= 0) break;
+        sent += n;
+    }
+    sys1(SYS_CLOSE, fd);
+}
+
+#define nm_watch_log_literal(s) nm_watch_log((s), sizeof(s) - 1)
+
+/*
+ * Blocks on /dev/kmsg until init logs the first line of DoReboot ("Reboot start, reason:"),
+ * then clears all rules so init's /data umount is not held EBUSY by the rule path refs.
+ * Rules are re-created from the module trees on every boot, so nothing persistent is lost.
+ */
+static noinline int nm_reboot_watch(struct nm_payload *payload) {
+    /* Keep each devkmsg record intact; oversized reads are rejected without consuming it. */
+    char line[10240];
+    int kmsg = (int)sys3(SYS_OPENAT, AT_FDCWD, (long)"/dev/kmsg", O_RDONLY);
+    if (kmsg < 0) {
+        nm_watch_log_literal("NoMount reboot-watch: cannot open /dev/kmsg\n");
+        return 1;
+    }
+
+    /* devkmsg_open starts at the oldest retained record. Skip old boot logs. */
+    if (sys3(SYS_LSEEK, kmsg, 0, SEEK_END) < 0) {
+        nm_watch_log_literal("NoMount reboot-watch: cannot seek /dev/kmsg to its live end\n");
+        sys1(SYS_CLOSE, kmsg);
+        return 1;
+    }
+    nm_watch_log_literal("NoMount reboot-watch: armed; waiting for init reboot marker\n");
+
+    int overrun_logged = 0;
+    while (1) {
+        long n = sys3(SYS_READ, kmsg, (long)line, sizeof(line));
+        if (n == -NM_EINTR) continue;
+        if (n == -NM_EPIPE) {
+            /* The ring overran; devkmsg_read has moved this reader to its oldest record. */
+            if (!overrun_logged) {
+                nm_watch_log_literal("NoMount reboot-watch: kmsg records were dropped; resuming at oldest retained record\n");
+                overrun_logged = 1;
+            }
+            continue;
+        }
+        if (n <= 0) {
+            nm_watch_log_literal("NoMount reboot-watch: /dev/kmsg read failed before reboot marker\n");
+            sys1(SYS_CLOSE, kmsg);
+            return 1;
+        }
+        if (buf_contains(line, n, "Reboot start, reason:")) break;
+    }
+
+    payload->cmd = NM_CMD_CLEAR_RULES;
+    sys1(SYS_CLOSE, kmsg);
+    if (nm_send_payload(payload) < 0) {
+        nm_watch_log_literal("NoMount reboot-watch: init marker seen, but clearing rules failed\n");
+        return 1;
+    }
+    nm_watch_log_literal("NoMount reboot-watch: init marker seen; runtime rules cleared\n");
+    return 0;
 }
