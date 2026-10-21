@@ -18,4 +18,7 @@ if ! ensure_lkm_loaded; then
 fi
 
 klog "Kernel API ready (post-fs-data)"
+
+"$LOADER" reboot-watch </dev/null >/dev/null 2>&1 &
+
 exit 0
