@@ -28,6 +28,8 @@
 #define NM_FLAG_VIRTUAL_DIR (1 << 1)
 #define NM_FLAG_WHITEOUT    (1 << 2)
 #define NM_FLAG_OPAQUE      (1 << 3)
+#define NM_FLAG_GONE        (1 << 4)
+#define NM_FLAG_FOREIGN     (1 << 5) /* added from another fs context; the worker cannot resolve its text */
 
 /* flags for cleanup */
 #define NM_CLEAR_UIDS  (1 << 0)
@@ -124,10 +126,13 @@ struct nm_leaf {
     struct nm_dir_node *this_dir;
     struct nm_dir_node *parent_dir;
     unsigned long v_ino;
+    unsigned long verify_at;        /* jiffies; the worker re-walks the target text once this passes */
+    bool revive;
     u32 v_hash;
     u16 v_len;
     u16 child_len;
     bool native_file;
+    const struct cred *cred;
     struct hlist_node ht_node;
     struct nm_leaf *next;
     char paths[];
