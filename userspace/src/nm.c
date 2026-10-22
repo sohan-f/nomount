@@ -317,7 +317,7 @@ void c_main(long *sp) {
                 "  nm uid block_isolated [on/1 | off/0]    Toggle isolated process blocking\n\n"
                 "General Commands:\n"
                 "  nm clear all                            Clear all rules and UIDs\n"
-                "  nm reboot-watch                         Clear rules when a real reboot starts\n"
+                "  nm reboot-watch                         Clear rules and rotate logs when a real reboot starts\n"
                 "  nm version, v, -v                       Show driver version\n"
             );
             exit_code = 1;
