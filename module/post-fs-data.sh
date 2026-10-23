@@ -17,7 +17,7 @@ if ! ensure_lkm_loaded; then
     exit 1
 fi
 
-klog "Kernel API ready (post-fs-data)"
+klog "Kernel API ready (post-fs-data), driver $("$LOADER" version 2>/dev/null | head -n1)"
 
 "$LOADER" reboot-watch </dev/null >/dev/null 2>&1 &
 

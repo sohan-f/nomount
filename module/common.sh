@@ -55,6 +55,12 @@ _lock_fd() {
     return 0
 }
 
+module_version() {
+    local ver
+    ver=$(sed -n 's/^version=//p' "$PROP_FILE" 2>/dev/null | head -n1 | tr -d '\r')
+    echo "${ver:-unknown}"
+}
+
 bootloop_check() {
     exec 8>"$NOMOUNT_DATA/.boot.lock"
     if ! _lock_fd 8 15; then
@@ -76,7 +82,7 @@ bootloop_check() {
             return 1
         fi
     else
-        klog "NoMount module boot log started"
+        klog "NoMount module $(module_version), kernel $(uname -r)"
         echo "$current" > "$BOOT_SEMAPHORE"
     fi
 
