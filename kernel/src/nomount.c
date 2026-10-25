@@ -462,7 +462,8 @@ static struct dentry *nm_hijacked_lookup(struct inode *dir, struct dentry *dentr
     if (likely((nm_iop = nm_get_nm_iop(rcu_dereference(dir->i_op))))) {
         orig_iop = nm_iop->orig_iop;
         dir_node = rcu_dereference(nm_iop->dir_node);
-        if (dir_node && !atomic_inc_not_zero(&dir_node->refs))
+        if (dir_node && (!rcu_access_pointer(dir_node->children) ||
+                         !atomic_inc_not_zero(&dir_node->refs)))
             dir_node = NULL;
     }
     rcu_read_unlock();
