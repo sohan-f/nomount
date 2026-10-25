@@ -931,12 +931,14 @@ static int nm_d_revalidate_common(struct inode *parent_inode, const struct qstr 
                             ? nm_find_leaf_in_dir(parent_dir, name->name, name->len) : NULL;
     if (leaf && !nm_is_uid_blocked((fsuid = current_fsuid().val)) && (rule = nm_select_rule(leaf, fsuid))) {
         has_rule = true;
-        if (rule->flags & NM_FLAG_WHITEOUT)
+        if (rule->flags & NM_FLAG_WHITEOUT) {
             whiteout = true;
-        else if (nm_rule_pin_stale(rule))
-            stale = true;
-        else if (inode && (inode->i_op == &nm_file_iops || inode->i_op == &nm_dir_iops))
-            match_rule = nm_inode_matches_binding(inode, &rule->r_path, (rule->flags & NM_FLAG_IS_DIR) ? leaf->this_dir : NULL, rule->flags & NM_FLAG_OPAQUE);
+        } else {
+            if (inode && (inode->i_op == &nm_file_iops || inode->i_op == &nm_dir_iops))
+                match_rule = nm_inode_matches_binding(inode, &rule->r_path, (rule->flags & NM_FLAG_IS_DIR) ? leaf->this_dir : NULL, rule->flags & NM_FLAG_OPAQUE);
+            if (nm_rule_pin_stale(rule))
+                stale = true;
+        }
         nm_rebind_if_stale(rule);
     }
 
@@ -944,8 +946,8 @@ static int nm_d_revalidate_common(struct inode *parent_inode, const struct qstr 
     rcu_read_unlock();
 
     if (stale) {
-        /* complete_walk() turns a weak 0 into -ESTALE instead of re-looking-up. */
-        if (!weak || !(inode && nm_inode_is_virtual(inode))) goto drop_it;
+        /* complete_walk() turns a weak 0 into -ESTALE; jumped dentries skip d_revalidate(), so check the binding. */
+        if (!weak || !(inode && nm_inode_is_virtual(inode)) || !match_rule) goto drop_it;
         return 1;
     }
     if (whiteout) return !inode;
