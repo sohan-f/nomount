@@ -71,6 +71,69 @@ static __always_inline bool nm_same_mount_object(const struct vfsmount *a, const
 #endif
 }
 
+/* Clones keep sb + dentries alive without pinning the namespace mount. */
+struct nm_pin {
+    struct list_head list;
+    struct vfsmount *mnt;
+};
+
+static LIST_HEAD(nm_pin_list);
+static DEFINE_MUTEX(nm_pin_mutex);
+
+static int nm_pin_path(struct path *path)
+{
+    struct path root = { .mnt = path->mnt, .dentry = path->mnt->mnt_root };
+    struct nm_pin *pin;
+    struct vfsmount *mnt = NULL;
+    int err = 0;
+
+    mutex_lock(&nm_pin_mutex);
+    list_for_each_entry(pin, &nm_pin_list, list) {
+        if (nm_same_mount_object(pin->mnt, path->mnt)) {
+            mnt = pin->mnt;
+            mntget(mnt);
+            break;
+        }
+    }
+    if (!mnt) {
+        if (IS_ERR(mnt = clone_private_mount(&root))) {
+            err = PTR_ERR(mnt);
+            goto out;
+        }
+        if (!(pin = kmalloc(sizeof(*pin), GFP_KERNEL))) {
+            mntput(mnt);
+            err = -ENOMEM;
+            goto out;
+        }
+        pin->mnt = mnt;
+        mntget(mnt);
+        list_add(&pin->list, &nm_pin_list);
+    }
+out:
+    mutex_unlock(&nm_pin_mutex);
+    if (err) return err;
+    mntput(path->mnt);
+    path->mnt = mnt;
+    return 0;
+}
+
+static void nm_pin_release(void)
+{
+    struct nm_pin *pin;
+    LIST_HEAD(dead);
+
+    mutex_lock(&nm_pin_mutex);
+    list_splice_init(&nm_pin_list, &dead);
+    mutex_unlock(&nm_pin_mutex);
+
+    while (!list_empty(&dead)) {
+        pin = list_first_entry(&dead, struct nm_pin, list);
+        list_del(&pin->list);
+        mntput(pin->mnt);
+        kfree(pin);
+    }
+}
+
 /* Ancestors are not held by the endpoint refs and dentries are RCU-freed, so
  * both chains must be walked in one RCU section. Torn rename reads reject,
  * which is fail-closed; the next scan re-runs the walk. */
@@ -1399,6 +1462,8 @@ static int nm_prepare_rule(const char *r_path, u16 r_len, u32 flags, unsigned in
     if (backed) {
         int err = kern_path(r_path, LOOKUP_FOLLOW, &out->r_path);
         if (err) { memset(out, 0, sizeof(*out)); return err; }
+        if (nm_pin_path(&out->r_path))
+            nm_debug("mount pin fallback for %s\n", r_path);
         struct inode *inode = d_backing_inode(out->r_path.dentry);
         if (S_ISDIR(inode->i_mode)) out->flags |= NM_FLAG_IS_DIR;
     }
@@ -1445,6 +1510,8 @@ static int nm_resolve_anchor_locked(struct nm_leaf *leaf, u32 flags)
         return 0;
     }
 
+    if (nm_pin_path(&anchor))
+        nm_debug("mount pin fallback for anchor %s\n", leaf->paths);
     leaf->v_ino = inode->i_ino;
     d_drop(anchor.dentry);
     leaf->anchor = anchor;
@@ -1559,6 +1626,8 @@ static int nm_rule_reresolve(struct nm_rule *out, const struct nm_rule *rule, co
             (inode->i_mode & S_IFMT) == (old_inode->i_mode & S_IFMT)) {
             ret = new_path.dentry == rule->r_path.dentry ? 0 : 1;
             if (ret == 1) {
+                if (nm_pin_path(&new_path))
+                    nm_debug("mount pin fallback for %s\n", buf);
                 *out = *rule;
                 out->r_path = new_path;
             }
@@ -2301,6 +2370,7 @@ static void __exit nomount_exit(void)
     cancel_work_sync(&nm_rebind_work);
     flush_work(&nm_reclaim_work);
     rcu_barrier();
+    nm_pin_release();
     nm_info("Unloaded successfully\n");
 }
 
