@@ -199,10 +199,20 @@ static bool nm_fill_rule_info(struct nm_leaf *leaf, struct nm_rule *rule, struct
     return true;
 }
 
-static void nm_rebind_leaf_sync(struct nm_dir_node *dir_node, const struct qstr *name);
+static void nm_rebind_leaf_sync(struct nm_dir_node *dir_node, const struct qstr *name,
+                                struct dentry *locked_dir);
+
+/* ->lookup runs with the parent inode's i_rwsem held, shared or exclusive. */
+static inline struct dentry *nm_locked_dir(struct dentry *child, struct inode *dir)
+{
+    struct dentry *parent = READ_ONCE(child->d_parent);
+
+    return d_inode(parent) == dir ? parent : NULL;
+}
 
 static bool nm_resolve_leaf_for_lookup(struct nm_dir_node *dir_node, const struct qstr *name,
-                                       uid_t fsuid, struct nm_rule_info *out, bool *has_leaf)
+                                       uid_t fsuid, struct nm_rule_info *out, bool *has_leaf,
+                                       struct dentry *locked_dir)
 {
     bool found = false, stale = false;
 
@@ -222,7 +232,7 @@ static bool nm_resolve_leaf_for_lookup(struct nm_dir_node *dir_node, const struc
             found = nm_fill_rule_info(leaf, rule, out);
         rcu_read_unlock();
         if (!stale) break;
-        nm_rebind_leaf_sync(dir_node, name);
+        nm_rebind_leaf_sync(dir_node, name, locked_dir);
     }
     return found;
 }
@@ -469,7 +479,8 @@ static struct dentry *nm_hijacked_lookup(struct inode *dir, struct dentry *dentr
     rcu_read_unlock();
 
     if (dir_node) {
-        found = nm_resolve_leaf_for_lookup(dir_node, &dentry->d_name, fsuid, &rule_info, &has_leaf);
+        found = nm_resolve_leaf_for_lookup(dir_node, &dentry->d_name, fsuid, &rule_info, &has_leaf,
+                                           nm_locked_dir(dentry, dir));
         nm_dir_put(dir_node);
     }
 
@@ -837,7 +848,8 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
     rcu_read_lock();
     dn = READ_ONCE(info->dir_node);
     rcu_read_unlock();
-    found = nm_resolve_leaf_for_lookup(dn, &dentry->d_name, fsuid, &rule_info, &has_leaf);
+    found = nm_resolve_leaf_for_lookup(dn, &dentry->d_name, fsuid, &rule_info, &has_leaf,
+                                       nm_locked_dir(dentry, dir));
     if (found) return nm_materialize_rule(dir, dentry, &rule_info);
 
     if (info->opaque)
@@ -1557,7 +1569,54 @@ static int nm_rule_reresolve(struct nm_rule *out, const struct nm_rule *rule, co
     return ret;
 }
 
-static unsigned char nm_rebind_leaf_locked(struct nm_leaf *leaf)
+/* No VFS lock may be taken here: the hooks already hold the looked-up
+ * directory's i_rwsem, so kern_path() would deadlock on it. Resolve in the
+ * locked dentry with lookup_one_len() (no lock), else only from the dcache;
+ * the worker keeps kern_path(). */
+static int nm_rule_reresolve_sync(struct nm_rule *out, const struct nm_rule *rule,
+                                  struct dentry *locked_dir)
+{
+    struct dentry *old = rule->r_path.dentry, *parent, *new;
+    struct inode *inode, *old_inode;
+    struct path np;
+    int ret = -1;
+
+    if (!old || IS_ROOT(old) || !old->d_name.len) return -1;
+    parent = dget_parent(old);
+    if (parent == locked_dir) {
+        new = lookup_one_len(old->d_name.name, parent, old->d_name.len);
+        if (IS_ERR(new)) goto out;
+    } else {
+        /* Same revalidation the VFS applies to a cache hit. */
+        new = d_lookup(parent, &old->d_name);
+        if (!new) goto out;
+        if (unlikely(new->d_flags & DCACHE_OP_REVALIDATE) &&
+            new->d_op->d_revalidate(new, 0) <= 0) {
+            dput(new);
+            goto out;
+        }
+    }
+    inode = d_backing_inode(new);
+    old_inode = d_backing_inode(old);
+    /* Same parent dentry, so the dtree position and rule->r_path.mnt hold;
+     * only the type, a final symlink and a stacked mount can still differ. */
+    if (new == old || !inode || !old_inode || d_is_symlink(new) || d_mountpoint(new) ||
+        (inode->i_mode & S_IFMT) != (old_inode->i_mode & S_IFMT)) {
+        dput(new);
+        goto out;
+    }
+    np.mnt = rule->r_path.mnt;
+    np.dentry = new;
+    mntget(np.mnt);
+    *out = *rule;
+    out->r_path = np;
+    ret = 1;
+out:
+    dput(parent);
+    return ret;
+}
+
+static unsigned char nm_rebind_leaf_locked(struct nm_leaf *leaf, struct dentry *locked_dir)
 {
     struct nm_rule_array *old, *array;
     const char *old_h;
@@ -1586,7 +1645,8 @@ static unsigned char nm_rebind_leaf_locked(struct nm_leaf *leaf)
         struct nm_rule out;
 
         if (nm_rule_pin_stale(rule)) {
-            int rr = nm_rule_reresolve(&out, rule, old_h);
+            int rr = locked_dir ? nm_rule_reresolve_sync(&out, rule, locked_dir)
+                                : nm_rule_reresolve(&out, rule, old_h);
 
             if (rr > 0) {
                 array->rules[i] = out;
@@ -1608,7 +1668,8 @@ static unsigned char nm_rebind_leaf_locked(struct nm_leaf *leaf)
     return state;
 }
 
-static void nm_rebind_leaf_sync(struct nm_dir_node *dir_node, const struct qstr *name)
+static void nm_rebind_leaf_sync(struct nm_dir_node *dir_node, const struct qstr *name,
+                                struct dentry *locked_dir)
 {
     struct nm_leaf *leaf;
     unsigned char state;
@@ -1618,7 +1679,7 @@ static void nm_rebind_leaf_sync(struct nm_dir_node *dir_node, const struct qstr 
     leaf = nm_find_leaf_in_dir(dir_node, name->name, name->len);
     rcu_read_unlock();
     if (leaf && (!leaf->rebind_retry_at || !time_before(jiffies, leaf->rebind_retry_at))) {
-        state = nm_rebind_leaf_locked(leaf);
+        state = nm_rebind_leaf_locked(leaf, locked_dir);
         if (state == NM_RB_IDLE) {
             leaf->rebind_retry_at = 0;
             leaf->rebind_worker_at = 0;
@@ -1654,7 +1715,7 @@ static void nm_rebind_rules(struct work_struct *work)
             more = true;
             break;
         }
-        state = nm_rebind_leaf_locked(leaf);
+        state = nm_rebind_leaf_locked(leaf, NULL);
         switch (state) {
         case NM_RB_IDLE:
             leaf->rebind_worker_at = 0;
