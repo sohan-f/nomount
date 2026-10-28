@@ -200,14 +200,11 @@ static struct nm_rule *nm_select_rule(struct nm_leaf *leaf, unsigned int uid)
     return fallback;
 }
 
-static struct nm_leaf *nm_find_leaf_in_dir(struct nm_dir_node *dir_node, const char *name, size_t len)
+static struct nm_leaf *nm_find_leaf_in_children(struct nm_child_array *children, const char *name,
+                                                size_t len, u32 bloom_h)
 {
-    struct nm_child_array *children;
     struct nm_leaf *leaf = NULL;
 
-    if (!dir_node || !(children = rcu_dereference(dir_node->children)))
-        return NULL;
-    u32 bloom_h = nm_qhash(name, len);
     if (!children->bloom_words) {
         struct nm_child *entries = nm_entries(children);
         for (int i = 0; i < children->count; i++) {
@@ -216,11 +213,27 @@ static struct nm_leaf *nm_find_leaf_in_dir(struct nm_dir_node *dir_node, const c
                 break;
             }
         }
-    } else if (unlikely(nm_bloom_test(children, bloom_h))) {
+    } else {
         u32 hash = full_name_hash((const void *)(unsigned long)NM_MAGIC_SIG, name, len);
         leaf = nm_bsearch_child(children, name, len, hash, NULL);
     }
     return leaf;
+}
+
+/* Bloom misses must not pay for the memcmp/hash frame: that is the common
+ * case for every native name in a directory that only has a few rules. */
+static __always_inline struct nm_leaf *nm_find_leaf_in_dir(struct nm_dir_node *dir_node,
+                                                           const char *name, size_t len)
+{
+    struct nm_child_array *children;
+    u32 bloom_h;
+
+    if (!dir_node || !(children = rcu_dereference(dir_node->children)))
+        return NULL;
+    bloom_h = nm_qhash(name, len);
+    if (children->bloom_words && !nm_bloom_test(children, bloom_h))
+        return NULL;
+    return nm_find_leaf_in_children(children, name, len, bloom_h);
 }
 
 static bool nm_fill_rule_info(struct nm_leaf *leaf, struct nm_rule *rule, struct nm_rule_info *out)
@@ -492,7 +505,8 @@ static struct dentry *nm_hijacked_lookup(struct inode *dir, struct dentry *dentr
     if (likely((nm_iop = nm_get_nm_iop(rcu_dereference(dir->i_op))))) {
         orig_iop = nm_iop->orig_iop;
         dir_node = rcu_dereference(nm_iop->dir_node);
-        if (dir_node && !atomic_inc_not_zero(&dir_node->refs))
+        if (dir_node && (!rcu_access_pointer(dir_node->children) ||
+                         !atomic_inc_not_zero(&dir_node->refs)))
             dir_node = NULL;
     }
     rcu_read_unlock();
@@ -584,17 +598,22 @@ static int nm_hijacked_drop_inode(struct inode *inode)
 
 static void nm_hijacked_evict_inode(struct inode *inode)
 {
-    struct nm_sop *nm_sop = nm_get_nm_sop(smp_load_acquire(&inode->i_sb->s_op));
-    bool virtual = nm_inode_is_virtual(inode);
+    struct nm_sop *nm_sop;
 
-    virtual ? nm_destroy_virtual_inode(inode) : nm_destroy_hijacked_inode(inode);
-
-    if (!virtual && nm_sop && nm_sop->orig_sop && nm_sop->orig_sop->evict_inode) {
-        nm_sop->orig_sop->evict_inode(inode);
-    } else {
-        truncate_inode_pages_final(&inode->i_data);
-        clear_inode(inode);
+    if (nm_inode_is_virtual(inode)) {
+        nm_destroy_virtual_inode(inode);
+        goto clear;
     }
+    nm_destroy_hijacked_inode(inode);
+
+    nm_sop = nm_get_nm_sop(smp_load_acquire(&inode->i_sb->s_op));
+    if (nm_sop && nm_sop->orig_sop && nm_sop->orig_sop->evict_inode) {
+        nm_sop->orig_sop->evict_inode(inode);
+        return;
+    }
+clear:
+    truncate_inode_pages_final(&inode->i_data);
+    clear_inode(inode);
 }
 
 /*** file / inode / superblock operations ***/
@@ -956,8 +975,7 @@ static int nm_d_revalidate_common(struct inode *parent_inode, const struct qstr 
         parent_dir = rcu_dereference(iop->dir_node);
     }
 
-    struct nm_leaf *leaf = (parent_dir && rcu_access_pointer(parent_dir->children))
-                            ? nm_find_leaf_in_dir(parent_dir, name->name, name->len) : NULL;
+    struct nm_leaf *leaf = nm_find_leaf_in_dir(parent_dir, name->name, name->len);
     if (leaf && !nm_is_uid_blocked((fsuid = current_fsuid().val)) && (rule = nm_select_rule(leaf, fsuid))) {
         has_rule = true;
         if (rule->flags & NM_FLAG_WHITEOUT) {
