@@ -217,6 +217,7 @@ void c_main(long *sp) {
                         int is_white_flag  = (flags & 4);
                         int is_virtual_dir = (flags & 2);
                         int is_opaque      = (flags & 8);
+                        int is_gone        = (flags & 16);
 
                         if (args.is_json) {
                             list_print_literal_offset(&output, ",\n  {\n    \"virtual\": \"", offset); offset = 0;
@@ -226,6 +227,7 @@ void c_main(long *sp) {
                             else {
                                 list_print_literal(&output, "\",\n    \"real\": \""); list_print_json_strn(&output, r, rlen); list_print_literal(&output, "\"");
                                 if (is_opaque) list_print_literal(&output, ",\n    \"opaque\": true");
+                                if (is_gone) list_print_literal(&output, ",\n    \"target_gone\": true");
                             }
                             if (uid || uid_end || deny_start || deny_end) {
                                 if (uid == 0 && uid_end == 0) list_print_literal(&output, ",\n    \"default\": true");
@@ -246,6 +248,7 @@ void c_main(long *sp) {
                             else {
                                 list_print_literal(&output, " -> "); list_print_strn(&output, r, rlen);
                                 if (is_opaque) list_print_literal(&output, " (opaque)");
+                                if (is_gone) list_print_literal(&output, " (target gone)");
                             }
                             if (uid || uid_end) {
                                 list_print_literal(&output, " [UID: ");
