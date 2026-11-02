@@ -6,6 +6,38 @@
 #include <linux/xattr.h>
 #include <linux/module.h>
 #include "nomount.h"
+#include "hotops.h"
+
+/*** Identity anchors: matching compares addresses, and every TU including nomount.h
+ * gets its own tentative zero copies of the fake tables, so nm_get_nm_iop/fop/sop
+ * and nm_inode_is_virtual are only meaningful inside this TU — overlays must use
+ * base-provided helpers instead ***/
+static inline struct nm_dir_ops *nm_get_nm_iop(const struct inode_operations *iop) {
+    if (likely(iop) && iop->lookup == nm_hijacked_lookup)
+        return container_of(iop, struct nm_dir_ops, fake_iop);
+    return NULL;
+}
+
+static inline struct nm_dir_ops *nm_get_nm_fop(const struct file_operations *fop) {
+    if (unlikely(!fop)) return NULL;
+    if (fop->iterate_shared == nm_hijacked_iterate_dir)
+        return container_of(fop, struct nm_dir_ops, fake_fop);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
+    if (fop->iterate == nm_hijacked_iterate_dir)
+        return container_of(fop, struct nm_dir_ops, fake_fop);
+#endif
+    return NULL;
+}
+
+static inline struct nm_sop *nm_get_nm_sop(const struct super_operations *sop) {
+    if (likely(sop) && sop->evict_inode == nm_hijacked_evict_inode)
+        return container_of(sop, struct nm_sop, fake_sop);
+    return NULL;
+}
+
+static inline bool nm_inode_is_virtual(struct inode *inode) {
+    return inode->i_op == &nm_file_iops || inode->i_op == &nm_dir_iops;
+}
 
 /*** Helpers ***/
 
@@ -61,7 +93,7 @@ static __always_inline struct nm_leaf *nm_bsearch_child(struct nm_child_array *a
 	return NULL;
 }
 
-static struct nm_rule *nm_select_rule(struct nm_leaf *leaf, unsigned int uid)
+struct nm_rule *nm_select_rule(struct nm_leaf *leaf, unsigned int uid)
 {
     struct nm_rule_array *arr = rcu_dereference_check(leaf->rules, lockdep_is_held(&nm_mutex));
     struct nm_rule *fallback = NULL;
@@ -80,8 +112,9 @@ static struct nm_rule *nm_select_rule(struct nm_leaf *leaf, unsigned int uid)
     }
     return fallback;
 }
+EXPORT_SYMBOL_GPL(nm_select_rule);
 
-static struct nm_leaf *nm_find_leaf_in_dir(struct nm_dir_node *dir_node, const char *name, size_t len)
+struct nm_leaf *nm_find_leaf_in_dir(struct nm_dir_node *dir_node, const char *name, size_t len)
 {
     struct nm_child_array *children;
     struct nm_leaf *leaf = NULL;
@@ -103,6 +136,7 @@ static struct nm_leaf *nm_find_leaf_in_dir(struct nm_dir_node *dir_node, const c
     }
     return leaf;
 }
+EXPORT_SYMBOL_GPL(nm_find_leaf_in_dir);
 
 static bool nm_path_unchanged(struct dentry *d, const struct dentry *saved_parent,
                               const char *name, u16 namelen)
@@ -118,7 +152,7 @@ static bool nm_path_unchanged(struct dentry *d, const struct dentry *saved_paren
     return unchanged;
 }
 
-static int nm_resolve_rule_from_leaf(struct nm_leaf *leaf, uid_t fsuid, struct nm_rule_info *out)
+int nm_base_resolve_rule_from_leaf(struct nm_leaf *leaf, uid_t fsuid, struct nm_rule_info *out)
 {
     struct nm_rule *rule = nm_select_rule(leaf, fsuid);
     char *name = NULL;
@@ -139,8 +173,9 @@ static int nm_resolve_rule_from_leaf(struct nm_leaf *leaf, uid_t fsuid, struct n
     if (out->this_dir) atomic_inc(&out->this_dir->refs);
     return 1;
 }
+EXPORT_SYMBOL_GPL(nm_base_resolve_rule_from_leaf);
 
-static int nm_rebind_path(struct nm_rule_info *rule_info)
+int nm_base_rebind_path(struct nm_rule_info *rule_info)
 {
     struct dentry *new;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
@@ -158,6 +193,7 @@ static int nm_rebind_path(struct nm_rule_info *rule_info)
     rule_info->r_path.dentry = new;
     return 0;
 }
+EXPORT_SYMBOL_GPL(nm_base_rebind_path);
 
 static void nm_dir_rcu_free(struct rcu_head *head)
 {
@@ -339,14 +375,14 @@ static int nm_cached_inode_test(struct inode *inode, void *data)
     return inode->i_op == &nm_dir_iops && nm_inode_matches_binding(inode, &info->r_path, info->dir_node, info->opaque);
 }
 
-static struct dentry *nm_materialize_rule(struct inode *dir, struct dentry *dentry, struct nm_rule_info *rule_info)
+struct dentry *nm_base_materialize_rule(struct inode *dir, struct dentry *dentry, struct nm_rule_info *rule_info)
 {
     struct nm_inode_info probe = {0}, *info = NULL;
     struct inode *inode;
     struct dentry *res = ERR_PTR(-ENODATA);
 
     if (rule_info->r_name) {
-        int err = nm_rebind_path(rule_info);
+        int err = nm_hotops_rebind_path(rule_info);
         dput(rule_info->saved_parent);
         kfree(rule_info->r_name);
         if (err) goto negative_dentry;
@@ -394,6 +430,7 @@ out:
     if (rule_info->r_path.dentry) path_put(&rule_info->r_path);
     return res;
 }
+EXPORT_SYMBOL_GPL(nm_base_materialize_rule);
 
 /*** i_op / s_op / f_op Hijacking Hooks ***/
 static struct dentry *nm_hijacked_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
@@ -402,8 +439,12 @@ static struct dentry *nm_hijacked_lookup(struct inode *dir, struct dentry *dentr
     struct nm_rule_info rule_info = {0};
     struct nm_dir_ops *nm_iop = NULL;
     struct dentry *res, *target;
+    const struct nm_hotops *ops;
+    bool pinned;
     int found = 0;
     bool has_leaf = false;
+
+    ops = nm_hotops_current(&pinned);
 
     rcu_read_lock();
     if (likely((nm_iop = nm_get_nm_iop(rcu_dereference(dir->i_op))))) {
@@ -414,22 +455,30 @@ static struct dentry *nm_hijacked_lookup(struct inode *dir, struct dentry *dentr
             has_leaf = leaf != NULL;
             if (has_leaf) {
                 uid_t fsuid = current_fsuid().val;
-                if (likely(!nm_is_uid_blocked(fsuid))) found = nm_resolve_rule_from_leaf(leaf, fsuid, &rule_info);
+                if (likely(!nm_is_uid_blocked(fsuid))) found = ops->resolve_rule_from_leaf(leaf, fsuid, &rule_info);
             }
         }
     }
     rcu_read_unlock();
 
-    if (found < 0) return ERR_PTR(found);
-    if (found)
-        return nm_materialize_rule(dir, dentry, &rule_info);
+    if (found < 0) {
+        nm_hotops_release(ops, pinned);
+        return ERR_PTR(found);
+    }
+    if (found) {
+        res = ops->materialize_rule(dir, dentry, &rule_info);
+        nm_hotops_release(ops, pinned);
+        return res;
+    }
 
     if (likely(orig_iop && orig_iop->lookup)) {
         target = (res = orig_iop->lookup(dir, dentry, flags)) ? res : dentry;
         if (likely(!IS_ERR(target)) && has_leaf && !nm_is_pseudo_fs(dir->i_sb))
             nm_hijack_dentry_ops(dir, target, false);
+        nm_hotops_release(ops, pinned);
         return res;
     }
+    nm_hotops_release(ops, pinned);
     return ERR_PTR(-EOPNOTSUPP);
 }
 
@@ -776,6 +825,8 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
     struct nm_dir_node *dn;
     struct inode *r_dir;
     struct dentry *res;
+    const struct nm_hotops *ops;
+    bool pinned;
     uid_t fsuid = current_fsuid().val;
     int found = 0;
     bool has_leaf = false;
@@ -783,30 +834,43 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
     if (unlikely(!info || nm_is_uid_blocked(fsuid)))
         goto negative_dentry;
 
+    ops = nm_hotops_current(&pinned);
+
     rcu_read_lock();
     if (likely((dn = READ_ONCE(info->dir_node)) && rcu_access_pointer(dn->children))) {
         struct nm_leaf *leaf = nm_find_leaf_in_dir(dn, dentry->d_name.name, dentry->d_name.len);
         has_leaf = leaf != NULL;
-        if (leaf) found = nm_resolve_rule_from_leaf(leaf, fsuid, &rule_info);
+        if (leaf) found = ops->resolve_rule_from_leaf(leaf, fsuid, &rule_info);
     }
     rcu_read_unlock();
-    if (found < 0) return ERR_PTR(found);
-    if (found) return nm_materialize_rule(dir, dentry, &rule_info);
+    if (found < 0) {
+        nm_hotops_release(ops, pinned);
+        return ERR_PTR(found);
+    }
+    if (found) {
+        res = ops->materialize_rule(dir, dentry, &rule_info);
+        nm_hotops_release(ops, pinned);
+        return res;
+    }
 
     if (info->opaque)
-        goto negative_dentry;
+        goto negative_dentry_release;
 
     if (!info->r_path.dentry || !(r_dir = d_backing_inode(info->r_path.dentry)))
-        goto negative_dentry;
+        goto negative_dentry_release;
 
     if (r_dir->i_op->lookup) {
         res = r_dir->i_op->lookup(r_dir, dentry, flags);
         if (!IS_ERR(res ? res : dentry) && has_leaf && !nm_is_pseudo_fs(r_dir->i_sb))
             nm_hijack_dentry_ops(dir, res ? res : dentry, false);
+        nm_hotops_release(ops, pinned);
         return res;
     }
+    nm_hotops_release(ops, pinned);
     return ERR_PTR(-EOPNOTSUPP);
 
+negative_dentry_release:
+    nm_hotops_release(ops, pinned);
 negative_dentry:
     nm_hijack_dentry_ops(dir, dentry, true);
     d_add(dentry, NULL);
@@ -867,12 +931,13 @@ static int nm_shutdown_sync_fs(struct super_block *sb, int wait)
     return 0;
 }
 
-static bool nm_is_our_dops(struct nm_dir_ops *iop, const struct dentry_operations *dop)
+bool nm_is_our_dops(struct nm_dir_ops *iop, const struct dentry_operations *dop)
 {
     return dop == &nm_owned_dops || dop == &nm_dops || (iop && dop == &iop->fake_dops);
 }
+EXPORT_SYMBOL_GPL(nm_is_our_dops);
 
-static int nm_d_revalidate_common(struct inode *parent_inode, const struct qstr *name,
+int nm_base_d_revalidate_common(struct inode *parent_inode, const struct qstr *name,
                                   struct dentry *dentry, unsigned int flags, bool weak)
 {
     struct nm_dir_node *parent_dir = NULL;
@@ -920,19 +985,33 @@ static int nm_d_revalidate_common(struct inode *parent_inode, const struct qstr 
     }
     return nm_call_orig_revalidate(orig_dops, parent_inode, name, dentry, flags);
 }
+EXPORT_SYMBOL_GPL(nm_base_d_revalidate_common);
+
+static int nm_hotops_d_revalidate_dispatch(struct inode *parent_inode, const struct qstr *name,
+                                           struct dentry *dentry, unsigned int flags, bool weak)
+{
+    const struct nm_hotops *ops;
+    bool pinned;
+    int ret;
+
+    ops = nm_hotops_current(&pinned);
+    ret = ops->d_revalidate(parent_inode, name, dentry, flags, weak);
+    nm_hotops_release(ops, pinned);
+    return ret;
+}
 
 static int nm_d_weak_revalidate(struct dentry *dentry, unsigned int flags)
 {
-    return nm_d_revalidate_common(d_inode(READ_ONCE(dentry->d_parent)), &dentry->d_name, dentry, flags, true);
+    return nm_hotops_d_revalidate_dispatch(d_inode(READ_ONCE(dentry->d_parent)), &dentry->d_name, dentry, flags, true);
 }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
 static int nm_d_revalidate(struct inode *parent_inode, const struct qstr *name, struct dentry *dentry, unsigned int flags) {
-    return nm_d_revalidate_common(parent_inode, name, dentry, flags, false);
+    return nm_hotops_d_revalidate_dispatch(parent_inode, name, dentry, flags, false);
 }
 #else
 static int nm_d_revalidate(struct dentry *dentry, unsigned int flags) {
-    return nm_d_revalidate_common(d_inode(READ_ONCE(dentry->d_parent)), &dentry->d_name, dentry, flags, false);
+    return nm_hotops_d_revalidate_dispatch(d_inode(READ_ONCE(dentry->d_parent)), &dentry->d_name, dentry, flags, false);
 }
 #endif
 
@@ -945,6 +1024,76 @@ static const struct dentry_operations nm_dops = {
     .d_revalidate = nm_d_revalidate,
     .d_weak_revalidate = nm_d_weak_revalidate,
 };
+
+static const struct nm_hotops nm_hotops_default = {
+    .magic = NM_HOTOPS_MAGIC,
+    .abi_rev = NM_HOTOPS_ABI_REV,
+    .owner = NULL,
+    .resolve_rule_from_leaf = nm_base_resolve_rule_from_leaf,
+    .rebind_path = nm_base_rebind_path,
+    .materialize_rule = nm_base_materialize_rule,
+    .d_revalidate = nm_base_d_revalidate_common,
+};
+
+struct nm_hotops_ctl nm_hotops_ctl = {
+    .ptr = NULL,
+    .default_ops = &nm_hotops_default,
+};
+EXPORT_SYMBOL_GPL(nm_hotops_ctl);
+
+static DEFINE_MUTEX(nm_hotops_lock);
+
+int nm_hotops_register(struct nm_hotops *ops)
+{
+    if (!ops || ops->magic != NM_HOTOPS_MAGIC || ops->abi_rev != NM_HOTOPS_ABI_REV ||
+        !ops->owner || !ops->resolve_rule_from_leaf || !ops->rebind_path ||
+        !ops->materialize_rule || !ops->d_revalidate)
+        return -EINVAL;
+
+    mutex_lock(&nm_hotops_lock);
+    if (rcu_dereference_protected(nm_hotops_ctl.ptr, lockdep_is_held(&nm_hotops_lock))) {
+        mutex_unlock(&nm_hotops_lock);
+        return -EBUSY;
+    }
+    /* pin the base module so an overlay cannot outlive the table's identity anchors */
+    if (!try_module_get(THIS_MODULE)) {
+        mutex_unlock(&nm_hotops_lock);
+        return -ENODEV;
+    }
+    rcu_assign_pointer(nm_hotops_ctl.ptr, ops);
+    mutex_unlock(&nm_hotops_lock);
+    nm_info("hotops overlay registered (abi %u)\n", ops->abi_rev);
+    return 0;
+}
+EXPORT_SYMBOL_GPL(nm_hotops_register);
+
+void nm_hotops_unregister(const struct nm_hotops *ops)
+{
+    mutex_lock(&nm_hotops_lock);
+    if (rcu_dereference_protected(nm_hotops_ctl.ptr, lockdep_is_held(&nm_hotops_lock)) == ops) {
+        rcu_assign_pointer(nm_hotops_ctl.ptr, NULL);
+        /* drain the rcu-carried slot calls before the overlay's .text goes away */
+        synchronize_rcu();
+        rcu_barrier();
+        module_put(THIS_MODULE);
+        nm_info("hotops overlay unregistered\n");
+    }
+    mutex_unlock(&nm_hotops_lock);
+}
+EXPORT_SYMBOL_GPL(nm_hotops_unregister);
+
+int nm_hotops_rebind_path(struct nm_rule_info *rule_info)
+{
+    const struct nm_hotops *ops;
+    bool pinned;
+    int ret;
+
+    ops = nm_hotops_current(&pinned);
+    ret = ops->rebind_path(rule_info);
+    nm_hotops_release(ops, pinned);
+    return ret;
+}
+EXPORT_SYMBOL_GPL(nm_hotops_rebind_path);
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
 static const struct file_operations nm_file_fops_mmap_prepare = {

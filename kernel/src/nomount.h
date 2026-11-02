@@ -424,29 +424,6 @@ static inline struct dentry *nm_hash_and_lookup(struct dentry *dir, struct qstr 
     return (unlikely(dir->d_flags & DCACHE_OP_HASH) && dir->d_op->d_hash(dir, n) < 0) ? NULL : d_lookup(dir, n);
 }
 
-static inline struct nm_dir_ops *nm_get_nm_iop(const struct inode_operations *iop) {
-    if (likely(iop) && iop->lookup == nm_hijacked_lookup)
-        return container_of(iop, struct nm_dir_ops, fake_iop);
-    return NULL;
-}
-
-static inline struct nm_dir_ops *nm_get_nm_fop(const struct file_operations *fop) {
-    if (unlikely(!fop)) return NULL;
-    if (fop->iterate_shared == nm_hijacked_iterate_dir)
-        return container_of(fop, struct nm_dir_ops, fake_fop);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
-    if (fop->iterate == nm_hijacked_iterate_dir)
-        return container_of(fop, struct nm_dir_ops, fake_fop);
-#endif
-    return NULL;
-}
-
-static inline struct nm_sop *nm_get_nm_sop(const struct super_operations *sop) {
-    if (likely(sop) && sop->evict_inode == nm_hijacked_evict_inode)
-        return container_of(sop, struct nm_sop, fake_sop);
-    return NULL;
-}
-
 #define NM_DOP_INITIALIZING ((const struct dentry_operations *)1L)
 static inline const struct dentry_operations *nm_get_orig_dops(struct nm_dir_ops *iop)
 {
@@ -465,10 +442,6 @@ static inline int nm_call_orig_revalidate(const struct dentry_operations *dops, 
 #else
     return dops->d_revalidate(dentry, flags);
 #endif
-}
-
-static inline bool nm_inode_is_virtual(struct inode *inode) {
-    return inode->i_op == &nm_file_iops || inode->i_op == &nm_dir_iops;
 }
 
 static bool nm_is_pseudo_fs(struct super_block *sb)
