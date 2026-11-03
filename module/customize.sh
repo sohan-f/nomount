@@ -123,7 +123,7 @@ elif [ "$LKM_RUNNING" = true ]; then
 
   if [ "$KO_RC" = 0 ]; then
     STAGED_FOR_REBOOT=true
-    ui_print "  [+] New driver verified and staged for the next reboot."
+    ui_print "  [+] New driver verified and staged."
   elif [ "$KO_RC" = 2 ]; then
     ui_print "  [*] No new KO shipped; keeping the running driver as is."
   else
@@ -172,14 +172,14 @@ else
   fi
 fi
 
-# Hotops overlay: staged file only, activation is next boot or a rerun of
-# hotops-load.sh (e.g. as MODULE_HOT_RUN_SCRIPT on a hot module update).
+# Hotops overlay: staged to lkm/hotops.ko here; the tail of this script swaps
+# the module directory in place and attempts the load on the current boot.
 if [ "$BUILTIN" != true ]; then
   for pick in "$MODPATH/lkm/hotops-$AKVER-$KVER$ARCH_SFX.ko" "$MODPATH"/lkm/hotops*-$KVER$ARCH_SFX.ko; do
     [ -f "$pick" ] || continue
     mv "$pick" "$MODPATH/lkm/hotops.ko"
     rm -f "$MODPATH"/lkm/hotops-*.ko
-    ui_print "  [OK] Hotops overlay staged; activate on next boot or by rerunning hotops-load.sh."
+    ui_print "  [OK] Hotops overlay staged."
     break
   done
   if [ ! -f "$MODPATH/lkm/hotops.ko" ]; then
@@ -235,13 +235,41 @@ if [ "$NM_CURRENT_VER" -lt "$NM_REQUIRED_VER" ]; then
   fi
 fi
 
-if [ "$STAGED_FOR_REBOOT" = true ]; then
-  ui_print "  [OK] Update staged. Reboot to activate the new driver."
-  if [ "$NM_CURRENT_VER" -ge "$NM_REQUIRED_VER" ]; then
-    ui_print "       The current driver keeps working until then."
+if [ "$BOOTMODE" = true ]; then
+  # KernelSU boot-applies a metamodule by design (hot_install rejects them with
+  # "metamodules are always applied at boot"), so the install swaps its own
+  # module dir: same dance metainstall.sh performs for regular modules. Kernel
+  # memory keeps the running driver until reboot; only the files swap now.
+  HOT_LIVE="/data/adb/modules/nomount"
+  HOT_STAGE="/data/adb/modules_update/nomount"
+
+  busybox rm -rf "$HOT_LIVE"
+  busybox mv "$MODPATH" "$HOT_LIVE"
+  mkdir -p "$HOT_STAGE"
+  cat "$HOT_LIVE/module.prop" > "$HOT_STAGE/module.prop"
+  ( sleep 3 ; rm -rf "$HOT_LIVE/update" "$HOT_STAGE" ) &
+
+  ui_print "  [OK] Module directory hot-installed; no reboot pending."
+  if [ "$BUILTIN" != true ] && [ -f "$HOT_LIVE/lkm/hotops.ko" ]; then
+    sh "$HOT_LIVE/hotops-load.sh"
+    if cut -d' ' -f1 /proc/modules 2>/dev/null | grep -q '^nm_hotops_'; then
+      ui_print "  [OK] Hotops overlay live on the running driver; no reboot required."
+    else
+      if [ "$STAGED_FOR_REBOOT" = true ]; then
+        ui_print "  [!] Hotops overlay not live; reboot activates it with the new driver."
+      else
+        ui_print "  [!] Hotops overlay not live; check kmsg for the reason."
+      fi
+    fi
+  elif [ "$STAGED_FOR_REBOOT" = true ]; then
+    ui_print "  [*] Staged driver activates on the next boot."
   fi
 else
-  ui_print "  [OK] System is ready for injection."
+  if [ "$STAGED_FOR_REBOOT" = true ]; then
+    ui_print "  [OK] Update staged. Reboot to activate the new driver."
+  else
+    ui_print "  [OK] System is ready for injection."
+  fi
 fi
 
 NOMOUNT_DATA="/data/adb/nomount"
