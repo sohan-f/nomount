@@ -21,9 +21,17 @@ static struct nm_hotops nm_hotops_sample = {
     .d_revalidate = nm_base_d_revalidate_common,
 };
 
+/* try_module_get() inside nm_hotops_register() needs the overlay in MODULE_STATE_LIVE,
+ * which only holds after module_init() has returned, so registration runs from work. */
 static void sample_register(struct work_struct *work)
 {
-    sample_registered = nm_hotops_register(&nm_hotops_sample) == 0;
+    int rc = nm_hotops_register(&nm_hotops_sample);
+
+    sample_registered = rc == 0;
+    /* an inert but loaded module also blocks later registers with -EBUSY until it
+     * is rmmod'ed, so the reason must be visible without loader-side probing */
+    if (rc)
+        printk(KERN_WARNING "NoMount hotops sample: register failed (%d), staying inert\n", rc);
 }
 static DECLARE_WORK(sample_work, sample_register);
 
