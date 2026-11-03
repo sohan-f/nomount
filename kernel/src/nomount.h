@@ -2,6 +2,11 @@
 #define _LINUX_NOMOUNT_H
 
 #include <linux/types.h>
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/dcache.h>
+#include <linux/errno.h>
 #include <linux/idr.h>
 #include <linux/list.h>
 #include <linux/hashtable.h>
