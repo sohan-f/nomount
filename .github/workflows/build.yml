@@ -163,6 +163,13 @@ jobs:
           path: ${{ runner.temp }}/nomount-module-${{ github.run_id }}-${{ github.run_attempt }}/lkm
           merge-multiple: true
 
+      - name: Download all hotops artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: hotops-*
+          path: ${{ runner.temp }}/nomount-module-${{ github.run_id }}-${{ github.run_attempt }}/lkm
+          merge-multiple: true
+
       - name: Upload to Telegram
         if: env.BOT_TOKEN != '' && env.CHAT_ID != ''
         env:
