@@ -172,6 +172,27 @@ else
   fi
 fi
 
+# Hotops overlay: staged file only, activation is next boot or a rerun of
+# hotops-load.sh (e.g. as MODULE_HOT_RUN_SCRIPT on a hot module update).
+if [ "$BUILTIN" != true ]; then
+  for pick in "$MODPATH/lkm/hotops-$AKVER-$KVER$ARCH_SFX.ko" "$MODPATH"/lkm/hotops*-$KVER$ARCH_SFX.ko; do
+    [ -f "$pick" ] || continue
+    mv "$pick" "$MODPATH/lkm/hotops.ko"
+    rm -f "$MODPATH"/lkm/hotops-*.ko
+    ui_print "  [OK] Hotops overlay staged; activate on next boot or by rerunning hotops-load.sh."
+    break
+  done
+  if [ ! -f "$MODPATH/lkm/hotops.ko" ]; then
+    if [ -f "$OLD_MODPATH/lkm/hotops.ko" ]; then
+      cp "$OLD_MODPATH/lkm/hotops.ko" "$MODPATH/lkm/hotops.ko"
+      rm -f "$MODPATH"/lkm/hotops-*.ko
+      ui_print "  [*] No overlay update for this kernel; kept the previous one."
+    else
+      rm -f "$MODPATH"/lkm/hotops-*.ko
+    fi
+  fi
+fi
+
 NM_REQUIRED_VER=22
 NM_CURRENT_VER=$("$MODPATH/bin/nm" version 2>/dev/null | head -1 | grep -oE '^[0-9]+' | head -1)
 NM_CURRENT_VER=${NM_CURRENT_VER:-0}

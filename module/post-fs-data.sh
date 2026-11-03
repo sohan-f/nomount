@@ -18,4 +18,6 @@ if ! ensure_lkm_loaded; then
 fi
 
 klog "Kernel API ready (post-fs-data)"
+
+[ -f "$MODDIR/lkm/hotops.ko" ] && sh "$MODDIR/hotops-load.sh"
 exit 0
