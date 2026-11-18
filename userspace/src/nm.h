@@ -53,6 +53,7 @@ enum nm_cli_action {
     ACTION_MODULE_LOAD,
     ACTION_MODULE_UNLOAD,
     ACTION_MODULE_LIST,
+    ACTION_HELP,
 };
 
 struct nm_payload {
@@ -281,6 +282,10 @@ static noinline void parse_arguments(long argc, char **argv, struct nm_args *par
     if (argc < 2) return;
 
     const char *c1 = argv[1];
+    if (strcmp(c1, "--help") == 0 || strcmp(c1, "-h") == 0) {
+        parsed_args->action = ACTION_HELP;
+        return;
+    }
     if (strcmp(c1, "rule") == 0 && argc >= 3) {
         const char *c2 = argv[2];
         if (strcmp(c2, "add") == 0) parsed_args->action = ACTION_RULE_ADD;
