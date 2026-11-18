@@ -1605,11 +1605,33 @@ static struct nm_rule_array *nm_alloc_rule_array(int count)
     return arr;
 }
 
+static bool nm_valid_vpath(const char *path, u16 len)
+{
+    if (len <= 1 || path[0] != '/') return false;
+    for (u16 i = 1; i < len; ) {
+        u16 start = i;
+        while (i < len && path[i] != '/') {
+            if (!path[i]) return false;
+            i++;
+        }
+        u16 comp = i - start;
+        if (!comp || comp > NAME_MAX) return false;
+        if (path[start] == '.' && (comp == 1 || (comp == 2 && path[start + 1] == '.'))) return false;
+        if (i < len) i++;
+    }
+    return true;
+}
+
 static int nm_prepare_rule(const char *r_path, u32 flags, unsigned int uid, unsigned int uid_end,
                            unsigned int deny_start, unsigned int deny_end, struct nm_rule *out)
 {
-    bool backed = !(flags & (NM_FLAG_WHITEOUT | NM_FLAG_VIRTUAL_DIR));
+    bool backed;
+
+    if (flags & ~(NM_FLAG_VIRTUAL_DIR | NM_FLAG_WHITEOUT | NM_FLAG_OPAQUE)) return -EINVAL;
+    if ((flags & NM_FLAG_WHITEOUT) && (flags & (NM_FLAG_VIRTUAL_DIR | NM_FLAG_OPAQUE))) return -EINVAL;
+    backed = !(flags & (NM_FLAG_WHITEOUT | NM_FLAG_VIRTUAL_DIR));
     if (backed && !r_path) return -EINVAL;
+    if (flags & NM_FLAG_VIRTUAL_DIR) flags |= NM_FLAG_IS_DIR;
 
     memset(out, 0, sizeof(*out));
     out->flags = flags;
@@ -1621,7 +1643,7 @@ static int nm_prepare_rule(const char *r_path, u32 flags, unsigned int uid, unsi
         int err = kern_path(r_path, LOOKUP_FOLLOW, &out->r_path);
         if (err) return err;
         struct inode *inode = d_backing_inode(out->r_path.dentry);
-        if (nm_inode_is_virtual(inode)) {
+        if (nm_inode_is_virtual(inode) || (!S_ISDIR(inode->i_mode) && (flags & NM_FLAG_OPAQUE))) {
             path_put(&out->r_path);
             return -EINVAL;
         }
@@ -1648,7 +1670,7 @@ static struct nm_leaf *nm_alloc_leaf(const char *path, u16 len)
     atomic_set(&leaf->refs, 1);
     memcpy(leaf->paths, path, len);
     leaf->v_len = len;
-    leaf->v_hash = full_name_hash((const void *)(unsigned long)NM_MAGIC_SIG, path, len);
+    leaf->v_hash = full_name_hash((const void *)(unsigned long)NM_MAGIC_SIG, leaf->paths, len);
     leaf->v_ino = (unsigned long)leaf->v_hash;
     return leaf;
 }
@@ -1941,26 +1963,45 @@ static int nm_add_rule_locked(const char *v_path, const char *r_path, u16 v_len,
     if (READ_ONCE(nm_shutdown_released))
         return -ESHUTDOWN;
 
+    if (uid > uid_end)
+        return -EINVAL;
+
     if (deny_start || deny_end) {
         if (!deny_start || !deny_end) return -EINVAL;
         if (deny_start > deny_end) { unsigned int t = deny_start; deny_start = deny_end; deny_end = t; }
         if (deny_start < uid || deny_end > uid_end) return -EINVAL;
     }
 
+    char *kbuf = kmalloc((size_t)v_len + r_len + 2, GFP_KERNEL);
+    if (!kbuf) return -ENOMEM;
+    memcpy(kbuf, v_path, v_len);
+    while (v_len > 1 && kbuf[v_len - 1] == '/') v_len--;
+    kbuf[v_len] = '\0';
+    if (!nm_valid_vpath(kbuf, v_len)) {
+        kfree(kbuf);
+        return -EINVAL;
+    }
+
     char *r_buf = NULL;
-    if (r_path && r_len && !(r_buf = kmemdup_nul(r_path, r_len, GFP_KERNEL))) return -ENOMEM;
+    if (r_path && r_len) {
+        r_buf = kbuf + v_len + 1;
+        memcpy(r_buf, r_path, r_len);
+        r_buf[r_len] = '\0';
+    }
 
     err = nm_prepare_rule(r_buf, flags, uid, uid_end, deny_start, deny_end, &new_rule);
-    kfree(r_buf);
-    if (err) return err;
+    if (err) {
+        kfree(kbuf);
+        return err;
+    }
 
-    while (v_len > 1 && v_path[v_len - 1] == '/') v_len--;
-
-    fresh = !(leaf = nm_find_leaf(v_path, v_len));
-    if (fresh && IS_ERR((leaf = nm_alloc_leaf(v_path, v_len)))) {
+    fresh = !(leaf = nm_find_leaf(kbuf, v_len));
+    if (fresh && IS_ERR((leaf = nm_alloc_leaf(kbuf, v_len)))) {
+        kfree(kbuf);
         err = PTR_ERR(leaf);
         goto out_rule;
     }
+    kfree(kbuf);
 
     if (fresh && (new_rule.flags & NM_FLAG_IS_DIR))
         nm_resolve_anchor_locked(leaf);
