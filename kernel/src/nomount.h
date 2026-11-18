@@ -122,17 +122,17 @@ struct nm_rule_array {
 };
 
 struct nm_leaf {
-    struct path anchor;
     struct nm_rule_array __rcu *rules;
     struct nm_dir_node *this_dir;
     struct nm_dir_node *parent_dir;
     unsigned long v_ino;
-    u32 v_hash;
     u16 v_len;
     u16 child_len;
-    bool native_file;
     u16 child_hash;
+    bool native_file;
+    u32 v_hash;
     atomic_t refs;
+    struct path anchor;
     union { struct hlist_node ht_node; struct nm_leaf *next; struct rcu_head rcu; };
     char paths[];
 };
