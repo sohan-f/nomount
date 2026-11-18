@@ -108,10 +108,16 @@ struct nm_args {
     const char *mod_only;        /* comma-separated, NULL = all */
 };
 
-#define NM_DEFAULT_TARGETS \
-    "system system_ext vendor odm product apex oem optics prism mi_ext " \
-    "my_bigball my_carrier my_company my_engineering my_heytap my_manifest " \
-    "my_preload my_product my_region my_reserve my_stock"
+#define NM_PARTITIONS(X) \
+    X(system) X(system_ext) X(vendor) X(odm) X(product) X(apex) \
+    X(oem) X(optics) X(prism) X(mi_ext) \
+    X(my_bigball) X(my_carrier) X(my_company) X(my_engineering) \
+    X(my_heytap) X(my_manifest) X(my_preload) X(my_product) \
+    X(my_region) X(my_reserve) X(my_stock)
+
+#define NM_PARTITION_NAME(name) #name,
+#define NM_PARTITION_TARGET(name) #name " "
+#define NM_DEFAULT_TARGETS NM_PARTITIONS(NM_PARTITION_TARGET)
 
 struct nm_modinfo {
     char *mod_id;
@@ -453,10 +459,7 @@ static noinline int nm_send_payload(struct nm_payload *payload) {
 
 /* --- module walk helpers --- */
 
-static const char *const nm_partitions[] = {
-    "vendor", "system_ext", "product", "odm", "apex",
-    "oem", "optics", "prism", "mi_ext", NULL,
-};
+static const char *const nm_partitions[] = { NM_PARTITIONS(NM_PARTITION_NAME) NULL };
 
 static int nm_is_partition(const char *p, size_t len) {
     for (int i = 0; nm_partitions[i]; i++) {
