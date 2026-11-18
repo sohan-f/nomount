@@ -9,7 +9,66 @@
 
 /*** Helpers ***/
 
+static struct nm_uid_array __rcu *nm_uids = NULL;
+static DEFINE_HASHTABLE(nm_leaves_ht, 10);
+static DEFINE_MUTEX(nm_mutex);
+static LIST_HEAD(nm_sb_list);
+static struct nm_rule_array *nm_retired_arrays;
+static struct nm_leaf *nm_retired_leaves;
 static bool nm_block_isolated_uids = false;
+
+static int nm_uid_add(uid_t target)
+{
+    struct nm_uid_array *old, *new_arr;
+    int count = 0, pos = 0;
+
+    if ((old = rcu_dereference_protected(nm_uids, lockdep_is_held(&nm_mutex)))) {
+        count = old->count;
+        while (pos < count && old->uids[pos] < target) pos++;
+        if (pos < count && old->uids[pos] == target) return -EEXIST;
+    }
+
+    if (!(new_arr = kmalloc(sizeof(*new_arr) + (count + 1) * sizeof(uid_t), GFP_KERNEL)))
+        return -ENOMEM;
+
+    new_arr->count = count + 1;
+    if (old) {
+        if (pos > 0) memcpy(new_arr->uids, old->uids, pos * sizeof(uid_t));
+        if (pos < count) memcpy(new_arr->uids + pos + 1, old->uids + pos, (count - pos) * sizeof(uid_t));
+        memcpy(new_arr->bloom_mask, old->bloom_mask, sizeof(new_arr->bloom_mask));
+    } else {
+        memset(new_arr->bloom_mask, 0, sizeof(new_arr->bloom_mask));
+    }
+    new_arr->uids[pos] = target;
+    nm_uid_bloom_set(new_arr, target);
+    rcu_assign_pointer(nm_uids, new_arr);
+    if (old) kfree_rcu(old, rcu);
+    return 0;
+}
+
+static int nm_uid_del(uid_t target)
+{
+    struct nm_uid_array *old, *new_arr = NULL;
+    int count, target_idx = -1;
+
+    if (!(old = rcu_dereference_protected(nm_uids, lockdep_is_held(&nm_mutex)))) return -ENOENT;
+    for (int i = 0; i < (count = old->count); i++) if (old->uids[i] == target) { target_idx = i; break; }
+    if (target_idx < 0) return -ENOENT;
+
+    if (count > 1) {
+        if (!(new_arr = kmalloc(sizeof(*new_arr) + (count - 1) * sizeof(uid_t), GFP_KERNEL))) return -ENOMEM;
+        new_arr->count = count - 1;
+        if (target_idx > 0) memcpy(new_arr->uids, old->uids, target_idx * sizeof(uid_t));
+        if (target_idx < count - 1) memcpy(new_arr->uids + target_idx, old->uids + target_idx + 1, (count - target_idx - 1) * sizeof(uid_t));
+        memset(new_arr->bloom_mask, 0, sizeof(new_arr->bloom_mask));
+        for (int i = 0; i < new_arr->count; i++)
+            nm_uid_bloom_set(new_arr, new_arr->uids[i]);
+    }
+
+    rcu_assign_pointer(nm_uids, new_arr);
+    kfree_rcu(old, rcu);
+    return 0;
+}
 static __always_inline bool nm_is_uid_blocked(uid_t target_uid)
 {
     struct nm_uid_array *arr;
