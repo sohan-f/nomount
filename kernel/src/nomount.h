@@ -237,20 +237,26 @@ static inline u32 nm_unpack_pos(loff_t pos) {
 /* --- UIDs Array RCU Management --- */
 static __always_inline void nm_uid_bloom_set(struct nm_uid_array *arr, uid_t uid)
 {
-    arr->bloom_mask[(uid >> 6) & 3] |= 1ULL << (uid & 63);
+    u32 h = uid * 0x9E3779B1U;
+    arr->bloom_mask[h >> 30] |= 1ULL << ((h >> 24) & 63);
+    arr->bloom_mask[(h >> 22) & 3] |= 1ULL << ((h >> 16) & 63);
 }
 static __always_inline bool nm_uid_bloom_test(struct nm_uid_array *arr, uid_t uid)
 {
-    return !!(arr->bloom_mask[(uid >> 6) & 3] & (1ULL << (uid & 63)));
+    u32 h = uid * 0x9E3779B1U;
+    return (arr->bloom_mask[h >> 30] & (1ULL << ((h >> 24) & 63))) &&
+           (arr->bloom_mask[(h >> 22) & 3] & (1ULL << ((h >> 16) & 63)));
 }
 
 static inline int nm_uid_add(uid_t target)
 {
     struct nm_uid_array *old, *new_arr;
-    int count = 0;
+    int count = 0, pos = 0;
 
     if ((old = rcu_dereference_protected(nm_uids, lockdep_is_held(&nm_mutex)))) {
-        for (int i = 0; i < (count = old->count); i++) if (old->uids[i] == target) return -EEXIST;
+        count = old->count;
+        while (pos < count && old->uids[pos] < target) pos++;
+        if (pos < count && old->uids[pos] == target) return -EEXIST;
     }
 
     if (!(new_arr = kmalloc(sizeof(*new_arr) + (count + 1) * sizeof(uid_t), GFP_KERNEL)))
@@ -258,12 +264,13 @@ static inline int nm_uid_add(uid_t target)
 
     new_arr->count = count + 1;
     if (old) {
-        memcpy(new_arr->uids, old->uids, count * sizeof(uid_t));
+        if (pos > 0) memcpy(new_arr->uids, old->uids, pos * sizeof(uid_t));
+        if (pos < count) memcpy(new_arr->uids + pos + 1, old->uids + pos, (count - pos) * sizeof(uid_t));
         memcpy(new_arr->bloom_mask, old->bloom_mask, sizeof(new_arr->bloom_mask));
     } else {
         memset(new_arr->bloom_mask, 0, sizeof(new_arr->bloom_mask));
     }
-    new_arr->uids[count] = target;
+    new_arr->uids[pos] = target;
     nm_uid_bloom_set(new_arr, target);
     rcu_assign_pointer(nm_uids, new_arr);
     if (old) kfree_rcu(old, rcu);

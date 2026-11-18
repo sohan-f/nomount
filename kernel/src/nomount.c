@@ -24,9 +24,13 @@ static __always_inline bool nm_is_uid_blocked(uid_t target_uid)
 
     rcu_guard();
     if ((arr = rcu_dereference(nm_uids)) && nm_uid_bloom_test(arr, target_uid)) {
-        for (int i = 0; i < arr->count; i++) {
-            if (arr->uids[i] == target_uid)
-                return true;
+        int lo = 0, hi = arr->count - 1;
+        while (lo <= hi) {
+            int mid = (lo + hi) >> 1;
+            uid_t cur = arr->uids[mid];
+            if (cur == target_uid) return true;
+            if (cur < target_uid) lo = mid + 1;
+            else hi = mid - 1;
         }
     }
     return false;
