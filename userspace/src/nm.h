@@ -19,6 +19,7 @@
 #ifndef NAME_MAX
 #define NAME_MAX  255
 #endif
+#define NM_WALK_MAX_DEPTH 128
 enum { NM_FLAG_VIRTUAL_DIR = 2, NM_FLAG_WHITEOUT = 4, NM_FLAG_OPAQUE = 8 };
 
 enum {
@@ -175,7 +176,11 @@ static int nm_catalog_add_module(struct nm_catalog *cat, const char *mod_id, con
     m->mod_id = nm_strdup(mod_id);
     m->name = nm_strdup(name);
     m->root = nm_strdup(root);
-    if (!m->mod_id || !m->name || !m->root) return -ENOMEM;
+    if (!m->mod_id || !m->name || !m->root) {
+        free(m->mod_id); free(m->name); free(m->root);
+        memset(m, 0, sizeof(*m));
+        return -ENOMEM;
+    }
     m->disable = disable;
     m->skip = skip;
     m->first_map = cat->nmaps;
@@ -194,7 +199,11 @@ static int nm_catalog_add_mapping(struct nm_catalog *cat, int module, const char
     struct nm_mapping *m = &cat->maps[cat->nmaps];
     m->vpath = nm_strdup(vpath);
     m->real = nm_strdup(real);
-    if (!m->vpath || !m->real) return -ENOMEM;
+    if (!m->vpath || !m->real) {
+        free(m->vpath); free(m->real);
+        m->vpath = m->real = NULL;
+        return -ENOMEM;
+    }
     m->dir = dir;
     cat->nmaps++;
     cat->mods[module].nmaps++;
@@ -573,7 +582,8 @@ static DIR *nm_open_dir(int parent, const char *name) {
     return d;
 }
 
-static int nm_dir_has_content(int parent, const char *name) {
+static int nm_dir_has_content(int parent, const char *name, int depth) {
+    if (depth > NM_WALK_MAX_DEPTH) return -ELOOP;
     DIR *d = nm_open_dir(parent, name);
     if (!d) return -errno;
     int result = 0;
@@ -589,7 +599,7 @@ static int nm_dir_has_content(int parent, const char *name) {
             if (fstatat(dirfd(d), e->d_name, &st, AT_SYMLINK_NOFOLLOW)) { result = -errno; break; }
             type = st.st_mode >> 12;
         }
-        if (type == DT_DIR && (result = nm_dir_has_content(dirfd(d), e->d_name))) break;
+        if (type == DT_DIR && (result = nm_dir_has_content(dirfd(d), e->d_name, depth + 1))) break;
     }
     closedir(d);
     return result;
@@ -704,7 +714,7 @@ static int nm_directory_rule(struct nm_walk *ctx, int fd) {
         opaque = n == 1 && value == 'y';
     }
     if (!opaque) return 0;
-    int entries = nm_dir_has_content(fd, ".");
+    int entries = nm_dir_has_content(fd, ".", 1);
     if (entries < 0) return entries;
     nm_emit(ctx, entries ? NM_FLAG_OPAQUE : NM_FLAG_WHITEOUT);
     return 0;
@@ -733,8 +743,11 @@ static int nm_walk_module(struct nm_walk *ctx, int parent_fd, const char *name,
     if (!d) return -errno;
     if (fstat(dirfd(d), &st)) { rc = -errno; goto done; }
     struct nm_ancestor here = { parent, st.st_dev, st.st_ino };
-    for (const struct nm_ancestor *a = parent; a; a = a->parent)
+    int depth = 1;
+    for (const struct nm_ancestor *a = parent; a; a = a->parent) {
         if (a->dev == here.dev && a->ino == here.ino) { rc = -ELOOP; goto done; }
+        if (++depth > NM_WALK_MAX_DEPTH) { rc = -ELOOP; goto done; }
+    }
     if ((rc = nm_directory_rule(ctx, dirfd(d)))) goto done;
     size_t len = strlen(ctx->path);
     for (;;) {
@@ -799,7 +812,8 @@ static int cmd_module_list(struct nm_workspace *ws, struct nm_args *args) {
     static const char *modules_dir = "/data/adb/modules";
     DIR *d = opendir(modules_dir);
     if (!d) return nm_error("module list", -errno);
-    struct nm_output out = { ws->cwd, 0, STDOUT_FILENO };
+    char out_buf[PATH_MAX];
+    struct nm_output out = { out_buf, 0, STDOUT_FILENO };
     struct nm_catalog cat = { 0 };
     const char *targets = args->mod_targets ? args->mod_targets : NM_DEFAULT_TARGETS;
 
