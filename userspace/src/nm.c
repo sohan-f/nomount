@@ -48,6 +48,12 @@ int main(int argc, char **argv) {
             else if (strcmp(argv[i], "--json") == 0 || strcmp(argv[i], "json") == 0) { args.is_json = 1; }
             else if (strcmp(argv[i], "--whiteout") == 0) { args.is_whiteout = 1; }
             else if (strcmp(argv[i], "--opaque") == 0) { args.is_opaque = 1; }
+            else if (argv[i][0] == '-') {
+                print_literal("nm: unknown option: ");
+                print_strn(argv[i], strlen(argv[i]));
+                print_literal("\n");
+                goto do_exit;
+            }
             else { needs_cwd = 1; argv[p_count++] = argv[i]; }
         }
     }
@@ -94,9 +100,12 @@ int main(int argc, char **argv) {
         case ACTION_UID_ADD:
         case ACTION_UID_DEL: {
             if (p_count < 1) goto do_exit;
+            const char *what = args.action == ACTION_UID_ADD ? "uid add" : "uid del";
+            unsigned int *uids = malloc((size_t)p_count * sizeof(*uids));
+            if (!uids) { exit_code = nm_error(what, -ENOMEM); goto do_exit; }
             for (int i = 0; i < p_count; i++) {
-                unsigned int uid = 0;
-                if (nm_parse_uid(argv[i], &uid)) {
+                if (nm_parse_uid(argv[i], &uids[i])) {
+                    free(uids);
                     print_literal("nm: invalid uid value\n");
                     exit_code = 1;
                     goto do_exit;
@@ -105,11 +114,10 @@ int main(int argc, char **argv) {
             payload->cmd = (args.action == ACTION_UID_ADD) ? NM_CMD_ADD_UID : NM_CMD_DEL_UID;
             exit_code = 0;
             for (int i = 0; i < p_count; i++) {
-                unsigned int uid = 0;
-                nm_parse_uid(argv[i], &uid);
-                payload->target_uid = uid;
+                payload->target_uid = uids[i];
                 exit_code |= (nm_send_payload(payload) < 0);
             }
+            free(uids);
             break;
         }
 
@@ -172,18 +180,32 @@ int main(int argc, char **argv) {
 
                 char *data = payload->buffer;
                 int pos = 0;
-                while (pos < payload->data_size) {
+                while (pos < (int)payload->data_size) {
+                    int avail = (int)payload->data_size - pos;
                     if (is_uids) {
+                        if (avail < (int)sizeof(unsigned int)) {
+                            exit_code = nm_error("uid list", -EIO);
+                            break;
+                        }
                         unsigned int uid = *(unsigned int *)(data + pos);
-                        pos += 4;
+                        pos += sizeof(unsigned int);
                         if (offset == 0) list_print_literal(&output, ",\n");
                         list_print_literal(&output, "  "); list_print_uint(&output, uid);
                         offset = 0;
                     } else {
+                        if (avail < (int)sizeof(struct nm_rule_hdr)) {
+                            exit_code = nm_error("rule list", -EIO);
+                            break;
+                        }
                         struct nm_rule_hdr *h = (void *)(data + pos);
+                        unsigned short vlen = h->v_len, rlen = h->r_len;
+                        if (vlen >= PATH_MAX || rlen >= PATH_MAX ||
+                            avail < (int)sizeof(*h) + vlen + rlen) {
+                            exit_code = nm_error("rule list", -EIO);
+                            break;
+                        }
                         unsigned int flags = h->flags, uid = h->uid, uid_end = h->uid_end;
                         unsigned int deny_start = h->deny_start, deny_end = h->deny_end;
-                        unsigned short vlen = h->v_len, rlen = h->r_len;
                         pos += sizeof(*h);
 
                         char *v = data + pos; pos += vlen;
@@ -236,7 +258,7 @@ int main(int argc, char **argv) {
                         }
                     }
                 }
-            } while (payload->arg1 != ~0U);
+            } while (!exit_code && payload->arg1 != ~0U);
 
             if (args.is_json) list_print_literal(&output, "\n]\n");
             list_flush(&output);
@@ -244,7 +266,9 @@ int main(int argc, char **argv) {
         }
 
         case ACTION_NONE:
+        case ACTION_HELP:
         default: {
+            exit_code = args.action == ACTION_HELP ? 0 : 1;
             print_literal(
                 "NoMount CLI (nm) - Usage Guide:\n\n"
                 "Rule Commands:\n"

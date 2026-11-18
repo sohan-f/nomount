@@ -19,6 +19,7 @@
 #ifndef NAME_MAX
 #define NAME_MAX  255
 #endif
+#define NM_WALK_MAX_DEPTH 128
 enum { NM_FLAG_VIRTUAL_DIR = 2, NM_FLAG_WHITEOUT = 4, NM_FLAG_OPAQUE = 8 };
 
 enum {
@@ -53,6 +54,7 @@ enum nm_cli_action {
     ACTION_MODULE_LOAD,
     ACTION_MODULE_UNLOAD,
     ACTION_MODULE_LIST,
+    ACTION_HELP,
 };
 
 struct nm_payload {
@@ -107,10 +109,17 @@ struct nm_args {
     const char *mod_only;        /* comma-separated, NULL = all */
 };
 
-#define NM_DEFAULT_TARGETS \
-    "system system_ext vendor odm product apex oem optics prism mi_ext " \
-    "my_bigball my_carrier my_company my_engineering my_heytap my_manifest " \
-    "my_preload my_product my_region my_reserve my_stock"
+/* One list drives both the default --targets string and partition detection. */
+#define NM_PARTITIONS(X) \
+    X(system) X(system_ext) X(vendor) X(odm) X(product) X(apex) \
+    X(oem) X(optics) X(prism) X(mi_ext) \
+    X(my_bigball) X(my_carrier) X(my_company) X(my_engineering) \
+    X(my_heytap) X(my_manifest) X(my_preload) X(my_product) \
+    X(my_region) X(my_reserve) X(my_stock)
+
+#define NM_PARTITION_NAME(name) #name,
+#define NM_PARTITION_TARGET(name) #name " "
+#define NM_DEFAULT_TARGETS NM_PARTITIONS(NM_PARTITION_TARGET)
 
 struct nm_modinfo {
     char *mod_id;
@@ -168,7 +177,11 @@ static int nm_catalog_add_module(struct nm_catalog *cat, const char *mod_id, con
     m->mod_id = nm_strdup(mod_id);
     m->name = nm_strdup(name);
     m->root = nm_strdup(root);
-    if (!m->mod_id || !m->name || !m->root) return -ENOMEM;
+    if (!m->mod_id || !m->name || !m->root) {
+        free(m->mod_id); free(m->name); free(m->root);
+        memset(m, 0, sizeof(*m));
+        return -ENOMEM;
+    }
     m->disable = disable;
     m->skip = skip;
     m->first_map = cat->nmaps;
@@ -187,7 +200,11 @@ static int nm_catalog_add_mapping(struct nm_catalog *cat, int module, const char
     struct nm_mapping *m = &cat->maps[cat->nmaps];
     m->vpath = nm_strdup(vpath);
     m->real = nm_strdup(real);
-    if (!m->vpath || !m->real) return -ENOMEM;
+    if (!m->vpath || !m->real) {
+        free(m->vpath); free(m->real);
+        m->vpath = m->real = NULL;
+        return -ENOMEM;
+    }
     m->dir = dir;
     cat->nmaps++;
     cat->mods[module].nmaps++;
@@ -281,6 +298,10 @@ static noinline void parse_arguments(long argc, char **argv, struct nm_args *par
     if (argc < 2) return;
 
     const char *c1 = argv[1];
+    if (strcmp(c1, "--help") == 0 || strcmp(c1, "-h") == 0) {
+        parsed_args->action = ACTION_HELP;
+        return;
+    }
     if (strcmp(c1, "rule") == 0 && argc >= 3) {
         const char *c2 = argv[2];
         if (strcmp(c2, "add") == 0) parsed_args->action = ACTION_RULE_ADD;
@@ -448,10 +469,7 @@ static noinline int nm_send_payload(struct nm_payload *payload) {
 
 /* --- module walk helpers --- */
 
-static const char *const nm_partitions[] = {
-    "vendor", "system_ext", "product", "odm", "apex",
-    "oem", "optics", "prism", "mi_ext", NULL,
-};
+static const char *const nm_partitions[] = { NM_PARTITIONS(NM_PARTITION_NAME) NULL };
 
 static int nm_is_partition(const char *p, size_t len) {
     for (int i = 0; nm_partitions[i]; i++) {
@@ -565,7 +583,8 @@ static DIR *nm_open_dir(int parent, const char *name) {
     return d;
 }
 
-static int nm_dir_has_content(int parent, const char *name) {
+static int nm_dir_has_content(int parent, const char *name, int depth) {
+    if (depth > NM_WALK_MAX_DEPTH) return -ELOOP;
     DIR *d = nm_open_dir(parent, name);
     if (!d) return -errno;
     int result = 0;
@@ -581,7 +600,7 @@ static int nm_dir_has_content(int parent, const char *name) {
             if (fstatat(dirfd(d), e->d_name, &st, AT_SYMLINK_NOFOLLOW)) { result = -errno; break; }
             type = st.st_mode >> 12;
         }
-        if (type == DT_DIR && (result = nm_dir_has_content(dirfd(d), e->d_name))) break;
+        if (type == DT_DIR && (result = nm_dir_has_content(dirfd(d), e->d_name, depth + 1))) break;
     }
     closedir(d);
     return result;
@@ -696,7 +715,7 @@ static int nm_directory_rule(struct nm_walk *ctx, int fd) {
         opaque = n == 1 && value == 'y';
     }
     if (!opaque) return 0;
-    int entries = nm_dir_has_content(fd, ".");
+    int entries = nm_dir_has_content(fd, ".", 1);
     if (entries < 0) return entries;
     nm_emit(ctx, entries ? NM_FLAG_OPAQUE : NM_FLAG_WHITEOUT);
     return 0;
@@ -725,8 +744,11 @@ static int nm_walk_module(struct nm_walk *ctx, int parent_fd, const char *name,
     if (!d) return -errno;
     if (fstat(dirfd(d), &st)) { rc = -errno; goto done; }
     struct nm_ancestor here = { parent, st.st_dev, st.st_ino };
-    for (const struct nm_ancestor *a = parent; a; a = a->parent)
+    int depth = 1;
+    for (const struct nm_ancestor *a = parent; a; a = a->parent) {
         if (a->dev == here.dev && a->ino == here.ino) { rc = -ELOOP; goto done; }
+        if (++depth > NM_WALK_MAX_DEPTH) { rc = -ELOOP; goto done; }
+    }
     if ((rc = nm_directory_rule(ctx, dirfd(d)))) goto done;
     size_t len = strlen(ctx->path);
     for (;;) {
@@ -791,7 +813,8 @@ static int cmd_module_list(struct nm_workspace *ws, struct nm_args *args) {
     static const char *modules_dir = "/data/adb/modules";
     DIR *d = opendir(modules_dir);
     if (!d) return nm_error("module list", -errno);
-    struct nm_output out = { ws->cwd, 0, STDOUT_FILENO };
+    char out_buf[PATH_MAX];
+    struct nm_output out = { out_buf, 0, STDOUT_FILENO };
     struct nm_catalog cat = { 0 };
     const char *targets = args->mod_targets ? args->mod_targets : NM_DEFAULT_TARGETS;
 
@@ -836,12 +859,15 @@ static int cmd_module_list(struct nm_workspace *ws, struct nm_args *args) {
         char *data = ws->payload.buffer;
         int pos = 0;
         while (pos < (int)ws->payload.data_size) {
+            int avail = (int)ws->payload.data_size - pos;
+            if (avail < (int)sizeof(struct nm_rule_hdr)) { rc = -EIO; break; }
             struct nm_rule_hdr *h = (void *)(data + pos);
             unsigned short vlen = h->v_len, rlen = h->r_len;
+            if (vlen >= PATH_MAX || rlen >= PATH_MAX ||
+                avail < (int)sizeof(*h) + vlen + rlen) { rc = -EIO; break; }
             pos += sizeof(*h);
             char *v = data + pos; pos += vlen;
             char *r = data + pos; pos += rlen;
-            if (vlen >= PATH_MAX || rlen >= PATH_MAX) continue;
             nm_catalog_count(&cat, v, vlen, r, rlen);
         }
         if (ws->payload.arg1 == ~0U) break;
