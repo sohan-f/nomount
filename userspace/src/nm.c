@@ -180,18 +180,32 @@ int main(int argc, char **argv) {
 
                 char *data = payload->buffer;
                 int pos = 0;
-                while (pos < payload->data_size) {
+                while (pos < (int)payload->data_size) {
+                    int avail = (int)payload->data_size - pos;
                     if (is_uids) {
+                        if (avail < (int)sizeof(unsigned int)) {
+                            exit_code = nm_error("uid list", -EIO);
+                            break;
+                        }
                         unsigned int uid = *(unsigned int *)(data + pos);
-                        pos += 4;
+                        pos += sizeof(unsigned int);
                         if (offset == 0) list_print_literal(&output, ",\n");
                         list_print_literal(&output, "  "); list_print_uint(&output, uid);
                         offset = 0;
                     } else {
+                        if (avail < (int)sizeof(struct nm_rule_hdr)) {
+                            exit_code = nm_error("rule list", -EIO);
+                            break;
+                        }
                         struct nm_rule_hdr *h = (void *)(data + pos);
+                        unsigned short vlen = h->v_len, rlen = h->r_len;
+                        if (vlen >= PATH_MAX || rlen >= PATH_MAX ||
+                            avail < (int)sizeof(*h) + vlen + rlen) {
+                            exit_code = nm_error("rule list", -EIO);
+                            break;
+                        }
                         unsigned int flags = h->flags, uid = h->uid, uid_end = h->uid_end;
                         unsigned int deny_start = h->deny_start, deny_end = h->deny_end;
-                        unsigned short vlen = h->v_len, rlen = h->r_len;
                         pos += sizeof(*h);
 
                         char *v = data + pos; pos += vlen;
@@ -244,7 +258,7 @@ int main(int argc, char **argv) {
                         }
                     }
                 }
-            } while (payload->arg1 != ~0U);
+            } while (!exit_code && payload->arg1 != ~0U);
 
             if (args.is_json) list_print_literal(&output, "\n]\n");
             list_flush(&output);

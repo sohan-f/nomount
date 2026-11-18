@@ -841,12 +841,15 @@ static int cmd_module_list(struct nm_workspace *ws, struct nm_args *args) {
         char *data = ws->payload.buffer;
         int pos = 0;
         while (pos < (int)ws->payload.data_size) {
+            int avail = (int)ws->payload.data_size - pos;
+            if (avail < (int)sizeof(struct nm_rule_hdr)) { rc = -EIO; break; }
             struct nm_rule_hdr *h = (void *)(data + pos);
             unsigned short vlen = h->v_len, rlen = h->r_len;
+            if (vlen >= PATH_MAX || rlen >= PATH_MAX ||
+                avail < (int)sizeof(*h) + vlen + rlen) { rc = -EIO; break; }
             pos += sizeof(*h);
             char *v = data + pos; pos += vlen;
             char *r = data + pos; pos += rlen;
-            if (vlen >= PATH_MAX || rlen >= PATH_MAX) continue;
             nm_catalog_count(&cat, v, vlen, r, rlen);
         }
         if (ws->payload.arg1 == ~0U) break;
