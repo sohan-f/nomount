@@ -81,7 +81,7 @@ int main(int argc, char **argv) {
 
             const char *cwd = "/";
             if (needs_cwd && !(cwd = getcwd(workspace.cwd, PATH_MAX)))
-                return nm_error("getcwd", -errno);
+                return nm_error("getcwd", NULL, -errno);
             int target_cmd = (args.action == ACTION_RULE_DEL) ? NM_CMD_DEL_RULE : NM_CMD_ADD_RULE;
 
             exit_code = 0;
@@ -102,7 +102,7 @@ int main(int argc, char **argv) {
             if (p_count < 1) goto do_exit;
             const char *what = args.action == ACTION_UID_ADD ? "uid add" : "uid del";
             unsigned int *uids = malloc((size_t)p_count * sizeof(*uids));
-            if (!uids) { exit_code = nm_error(what, -ENOMEM); goto do_exit; }
+            if (!uids) { exit_code = nm_error(what, NULL, -ENOMEM); goto do_exit; }
             for (int i = 0; i < p_count; i++) {
                 if (nm_parse_uid(argv[i], &uids[i])) {
                     free(uids);
@@ -184,7 +184,7 @@ int main(int argc, char **argv) {
                     int avail = (int)payload->data_size - pos;
                     if (is_uids) {
                         if (avail < (int)sizeof(unsigned int)) {
-                            exit_code = nm_error("uid list", -EIO);
+                            exit_code = nm_error("uid list", NULL, -EIO);
                             break;
                         }
                         unsigned int uid = *(unsigned int *)(data + pos);
@@ -194,14 +194,14 @@ int main(int argc, char **argv) {
                         offset = 0;
                     } else {
                         if (avail < (int)sizeof(struct nm_rule_hdr)) {
-                            exit_code = nm_error("rule list", -EIO);
+                            exit_code = nm_error("rule list", NULL, -EIO);
                             break;
                         }
                         struct nm_rule_hdr *h = (void *)(data + pos);
                         unsigned short vlen = h->v_len, rlen = h->r_len;
                         if (vlen >= PATH_MAX || rlen >= PATH_MAX ||
                             avail < (int)sizeof(*h) + vlen + rlen) {
-                            exit_code = nm_error("rule list", -EIO);
+                            exit_code = nm_error("rule list", NULL, -EIO);
                             break;
                         }
                         unsigned int flags = h->flags, uid = h->uid, uid_end = h->uid_end;

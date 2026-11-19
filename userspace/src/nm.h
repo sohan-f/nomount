@@ -498,11 +498,15 @@ static noinline int nm_path_join(char *dst, size_t dst_size, const char *a, cons
     return 0;
 }
 
-static int nm_error(const char *what, int error) {
+static int nm_error(const char *what, const char *path, int error) {
     char buffer[PATH_MAX];
     struct nm_output out = { buffer, 0, STDERR_FILENO };
     list_print_literal(&out, "nm: ");
     list_print_strn(&out, what, strlen(what));
+    if (path && *path) {
+        list_print_literal(&out, ": ");
+        list_print_strn(&out, path, strlen(path));
+    }
     list_print_literal(&out, ": errno ");
     list_print_uint(&out, -error);
     list_print_literal(&out, "\n");
@@ -710,7 +714,6 @@ static int nm_directory_rule(struct nm_walk *ctx, int fd) {
     if (!opaque) {
         char value;
         ssize_t n = fgetxattr(fd, "trusted.overlay.opaque", &value, 1);
-        if (n < 0 && errno != ENODATA && errno != ENOTSUP && errno != ERANGE) return -errno;
         opaque = n == 1 && value == 'y';
     }
     if (!opaque) return 0;
@@ -799,7 +802,7 @@ static int cmd_module_load_or_unload(struct nm_workspace *ws, struct nm_args *ar
         if (!rc) rc = nm_flush_rules(ctx.payload);
         if (!rc) rc = ctx.error;
     } else if (!rc) rc = -ENOTDIR;
-    if (rc) nm_error(is_load ? "module load" : "module unload", rc);
+    if (rc) nm_error(is_load ? "module load" : "module unload", ctx.path, rc);
     const char *status = is_load ? "nm_load_status=" : "nm_unload_status=";
     write_strn(STDERR_FILENO, status, strlen(status));
     write_strn(STDERR_FILENO, rc ? "1\n" : "0\n", 2);
@@ -811,10 +814,11 @@ static int cmd_module_load_or_unload(struct nm_workspace *ws, struct nm_args *ar
 static int cmd_module_list(struct nm_workspace *ws, struct nm_args *args) {
     static const char *modules_dir = "/data/adb/modules";
     DIR *d = opendir(modules_dir);
-    if (!d) return nm_error("module list", -errno);
+    if (!d) return nm_error("module list", NULL, -errno);
     char out_buf[PATH_MAX];
     struct nm_output out = { out_buf, 0, STDOUT_FILENO };
     struct nm_catalog cat = { 0 };
+    struct nm_walk ctx = { 0 };
     const char *targets = args->mod_targets ? args->mod_targets : NM_DEFAULT_TARGETS;
 
     ws->payload.cmd = NM_CMD_GET_LIST;
@@ -828,7 +832,9 @@ static int cmd_module_list(struct nm_workspace *ws, struct nm_args *args) {
         if (mod_id[0] == '.' || !strcmp(mod_id, "nomount")) continue;
         if (args->mod_only && !nm_mod_in_list(mod_id, args->mod_only)) continue;
         char mod_path[PATH_MAX], prop_path[PATH_MAX], name[256];
-        struct nm_walk ctx = { .catalog = ws->payload.data_size ? &cat : NULL };
+        ctx.catalog = ws->payload.data_size ? &cat : NULL;
+        ctx.error = 0;
+        ctx.has_injectable = 0;
         if ((rc = nm_path_join(mod_path, sizeof(mod_path), modules_dir, mod_id))) break;
         if ((rc = nm_dir_exists(mod_path)) < 0) break;
         if (!rc) continue;
@@ -836,6 +842,7 @@ static int cmd_module_list(struct nm_workspace *ws, struct nm_args *args) {
         rc = nm_read_module_name(prop_path, name, sizeof(name));
         if (rc == -ENOENT) { rc = 0; continue; }
         if (rc) break;
+        ctx.path[0] = '\0';
         if (!realpath(mod_path, ctx.path)) { rc = -errno; break; }
         ctx.root_len = strlen(ctx.path);
         if ((rc = nm_path_join(prop_path, sizeof(prop_path), mod_path, "disable"))) break;
@@ -893,7 +900,7 @@ static int cmd_module_list(struct nm_workspace *ws, struct nm_args *args) {
     list_flush(&out);
 skip_list:
     nm_catalog_free(&cat);
-    return rc ? nm_error("module list", rc) : 0;
+    return rc ? nm_error("module list", ctx.path, rc) : 0;
 }
 
 #endif // #ifndef NM_H
