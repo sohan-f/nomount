@@ -7,6 +7,7 @@
 #include <linux/hashtable.h>
 #include <linux/rcupdate.h>
 #include <linux/workqueue.h>
+#include <linux/llist.h>
 #include <linux/rwsem.h>
 #include <linux/atomic.h>
 #include <linux/file.h>
@@ -72,6 +73,11 @@ struct nm_sop {
     struct export_operations fake_export_op;
     const struct export_operations *orig_export_op;
     struct super_block *sb;
+    struct file_system_type *sb_type;
+    dev_t sb_dev;
+    struct super_block *restore_sb;
+    struct list_head restore_link;
+    bool detached_sops;
     struct rcu_head rcu;
     struct list_head list;
 };
@@ -80,6 +86,11 @@ struct nm_inode_info {
     struct path r_path;
     union { struct nm_dir_node *dir_node; struct nm_leaf *leaf; const void *node; };
     struct file *r_file;
+    struct inode *inode;
+    atomic_t deferred_refs;
+    struct llist_node deferred_node;
+    bool deferred_evict;
+    bool is_dir;
     bool opaque;
     bool backing_child;
     struct rcu_head rcu;
@@ -193,6 +204,7 @@ extern int vfs_path_lookup(struct dentry *, struct vfsmount *, const char *, uns
 static struct dentry *nm_hijacked_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags);
 static int nm_hijacked_iterate_dir(struct file *file, struct dir_context *ctx);
 static void nm_hijacked_put_super(struct super_block *sb);
+static void nm_unhook_superblock_locked(struct nm_sop *nm_sop, struct super_block *sb);
 static void nm_hijack_dentry_ops(struct inode *dir, struct dentry *dentry, bool injected);
 static void nm_dir_put(struct nm_dir_node *dir_node);
 static void nm_leaf_put(struct nm_leaf *leaf);
@@ -497,6 +509,9 @@ static bool nm_is_pseudo_fs(struct super_block *sb)
 #endif
     case SELINUX_MAGIC:
     case BPF_FS_MAGIC:
+#ifdef RDTGROUP_SUPER_MAGIC
+    case RDTGROUP_SUPER_MAGIC:
+#endif
         return true;
     default:
         return false;
@@ -511,10 +526,9 @@ static bool nm_is_kernfs(struct super_block *sb)
 #ifdef CGROUP2_SUPER_MAGIC
     case CGROUP2_SUPER_MAGIC:
 #endif
-    case TRACEFS_MAGIC:
-    case SECURITYFS_MAGIC:
-    case BPF_FS_MAGIC:
-    case DEBUGFS_MAGIC:
+#ifdef RDTGROUP_SUPER_MAGIC
+    case RDTGROUP_SUPER_MAGIC:
+#endif
         return true;
     default:
         return false;
