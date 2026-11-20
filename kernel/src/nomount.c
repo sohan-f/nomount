@@ -184,6 +184,11 @@ static void nm_refresh_binding(struct inode *inode, const struct path *path)
     else path_put(path);
 }
 
+static void nm_reclaim(struct work_struct *work);
+static DECLARE_WORK(nm_reclaim_work, nm_reclaim);
+static LLIST_HEAD(nm_deferred_infos);
+static bool nm_shutdown_released;
+
 static void nm_dir_rcu_free(struct rcu_head *head)
 {
     struct nm_dir_node *dir = container_of(head, struct nm_dir_node, rcu);
@@ -198,17 +203,52 @@ static void nm_dir_put(struct nm_dir_node *dir_node)
         call_rcu(&dir_node->rcu, nm_dir_rcu_free);
 }
 
-static inline void nm_destroy_virtual_inode(struct inode *inode)
+static void nm_virtual_info_free(struct nm_inode_info *info)
 {
-    struct nm_inode_info *info = READ_ONCE(inode->i_private);
-    if (!info) return;
-
-    WRITE_ONCE(inode->i_private, NULL);
     if (info->r_file) fput(info->r_file);
-    if (inode->i_op == &nm_file_iops) nm_leaf_put(info->leaf);
-    else nm_dir_put(info->dir_node);
+    if (info->is_dir) nm_dir_put(info->dir_node);
+    else nm_leaf_put(info->leaf);
     if (info->r_path.dentry) path_put(&info->r_path);
     kfree_rcu(info, rcu);
+}
+
+static inline void nm_destroy_virtual_inode(struct inode *inode)
+{
+    struct nm_inode_info *info = xchg(&inode->i_private, NULL);
+    if (info) nm_virtual_info_free(info);
+}
+
+static void nm_deferred_put(struct nm_inode_info *info)
+{
+    if (!info || !info->deferred_evict || !atomic_dec_and_test(&info->deferred_refs)) return;
+
+    /* The original evictor runs next; destructive cleanup belongs in process context. */
+    if (xchg(&info->inode->i_private, NULL) == info) {
+        llist_add(&info->deferred_node, &nm_deferred_infos);
+        schedule_work(&nm_reclaim_work);
+    }
+}
+
+static bool nm_deferred_dentry_get(struct dentry *dentry)
+{
+    struct inode *inode = d_backing_inode(dentry);
+    struct nm_inode_info *info;
+
+    if (!inode || !nm_inode_is_virtual(inode)) return false;
+    info = READ_ONCE(inode->i_private);
+    if (!info || !info->deferred_evict) return false;
+    if (dentry->d_fsdata == info) return true;
+    if (dentry->d_fsdata) return false;
+
+    atomic_inc(&info->deferred_refs);
+    dentry->d_fsdata = info;
+    return true;
+}
+
+static void nm_deferred_dentry_prune(struct dentry *dentry)
+{
+    struct nm_inode_info *info = xchg(&dentry->d_fsdata, NULL);
+    if (info) nm_deferred_put(info);
 }
 
 static inline void nm_destroy_hijacked_inode(struct inode *inode)
@@ -357,6 +397,10 @@ static void nm_init_prealloc_inode(struct inode *inode, struct nm_inode_info *in
     else
         inode->i_fop = &nm_dir_fops;
 
+    info->inode = inode;
+    atomic_set(&info->deferred_refs, 0);
+    info->deferred_evict = nm_is_kernfs(inode->i_sb);
+    info->is_dir = S_ISDIR(inode->i_mode);
     if (r_inode) {
         nm_sync_inode_times(inode, r_inode);
         inode->i_mapping = r_inode->i_mapping;
@@ -414,6 +458,7 @@ static struct dentry *nm_materialize_rule(struct inode *dir, struct dentry *dent
 {
     struct nm_inode_info probe, *info = NULL;
     struct inode *inode;
+    bool fresh_kernfs = nm_is_kernfs(dir->i_sb);
     struct dentry *res = ERR_PTR(rule_info->backing_child ? -ENOMEM : -ENODATA);
 
     if (rule_info->flags & NM_FLAG_WHITEOUT) goto negative_dentry;
@@ -429,21 +474,35 @@ static struct dentry *nm_materialize_rule(struct inode *dir, struct dentry *dent
         .backing_child = rule_info->backing_child,
     };
     if (rule_info->leaf) probe.leaf = rule_info->leaf;
-    inode = iget5_locked(dir->i_sb, rule_info->key, nm_cached_inode_test, nm_cached_inode_set, &probe);
+    /* Kernfs private state is per-dentry; cached aliases can resurrect freed info. */
+    if (fresh_kernfs) inode = new_inode(dir->i_sb);
+    else inode = iget5_locked(dir->i_sb, rule_info->key, nm_cached_inode_test, nm_cached_inode_set, &probe);
     if (!inode) goto out;
 
-    if (nm_inode_is_new(inode)) {
-        if (!(info = kmalloc(sizeof(*info), GFP_KERNEL))) { iget_failed(inode); goto out; }
+    if (fresh_kernfs || nm_inode_is_new(inode)) {
+        if (!(info = kmalloc(sizeof(*info), GFP_KERNEL))) {
+            if (fresh_kernfs) iput(inode);
+            else iget_failed(inode);
+            goto out;
+        }
         *info = probe;
         nm_init_prealloc_inode(inode, info, rule_info->v_ino);
-        unlock_new_inode(inode);
+        if (info->deferred_evict) ihold(inode);
+        if (!fresh_kernfs) unlock_new_inode(inode);
     } else {
         nm_refresh_binding(inode, &rule_info->r_path);
     }
     res = d_splice_alias(inode, dentry);
     if (!IS_ERR(res))
         nm_hijack_dentry_ops(dir, res ? res : dentry, true);
-    if (info) return res;
+    if (info) {
+        if (info->deferred_evict) {
+            if (!atomic_read(&info->deferred_refs))
+                nm_destroy_virtual_inode(inode);
+            iput(inode);
+        }
+        return res;
+    }
     goto out;
 
 negative_dentry:
@@ -688,6 +747,7 @@ static int nm_open(struct inode *inode, struct file *file)
     if (unlikely(!info)) return -ENODEV;
     if (unlikely(!info->r_path.dentry)) {
         file->private_data = NULL;
+        if (info->deferred_evict) atomic_inc(&info->deferred_refs);
         return 0;
     }
 
@@ -695,6 +755,7 @@ static int nm_open(struct inode *inode, struct file *file)
     if (readonly && (real_file = smp_load_acquire(&info->r_file)) && real_file->f_cred == file->f_cred) {
         if (!S_ISDIR(inode->i_mode)) nm_sync_inode_size(inode, file_inode(real_file));
         file->private_data = real_file;
+        if (info->deferred_evict) atomic_inc(&info->deferred_refs);
         return 0;
     }
 
@@ -707,6 +768,7 @@ static int nm_open(struct inode *inode, struct file *file)
         unsigned long magic = info->r_path.dentry->d_sb->s_magic;
         if (magic == EXT4_SUPER_MAGIC || magic == F2FS_SUPER_MAGIC) cmpxchg(&info->r_file, NULL, real_file);
     }
+    if (info->deferred_evict) atomic_inc(&info->deferred_refs);
     return 0;
 }
 
@@ -716,6 +778,7 @@ static int nm_release(struct inode *inode, struct file *file)
     struct file *real_file = file->private_data;
     if (real_file && info && real_file != READ_ONCE(info->r_file)) fput(real_file);
     file->private_data = NULL;
+    if (info && info->deferred_evict) nm_deferred_put(info);
     return 0;
 }
 
@@ -1045,14 +1108,42 @@ static int nm_xattr_set(const struct xattr_handler *handler, IDMAP_ARG struct de
     return proxy->orig->set(proxy->orig, IDMAP_CALL dentry, inode, name, buffer, size, flags);
 }
 
+static const struct export_operations *nm_orig_export_ops(struct super_block *sb)
+{
+    const struct export_operations *orig = NULL;
+    struct nm_sop *nm_sop = nm_get_nm_sop(smp_load_acquire(&sb->s_op));
+
+    if (nm_sop) return nm_sop->orig_export_op;
+
+    rcu_read_lock();
+    list_for_each_entry_rcu(nm_sop, &nm_sb_list, list) {
+        if (nm_sop->sb == sb && nm_sop->sb_dev == sb->s_dev) {
+            orig = nm_sop->orig_export_op;
+            break;
+        }
+    }
+    rcu_read_unlock();
+    return orig;
+}
+
 static int nm_encode_fh(struct inode *inode, __u32 *fh, int *max_len, struct inode *parent)
 {
-    struct nm_sop *nm_sop;
+    const struct export_operations *orig;
     if (nm_inode_is_virtual(inode)) return -ESTALE;
-    nm_sop = nm_get_nm_sop(smp_load_acquire(&inode->i_sb->s_op));
-    if (!nm_sop || !nm_sop->orig_export_op || !nm_sop->orig_export_op->encode_fh)
-        return -EOPNOTSUPP;
-    return nm_sop->orig_export_op->encode_fh(inode, fh, max_len, parent);
+    orig = nm_orig_export_ops(inode->i_sb);
+    if (!orig || !orig->encode_fh) return -EOPNOTSUPP;
+    return orig->encode_fh(inode, fh, max_len, parent);
+}
+
+static struct dentry *nm_export_get_parent(struct dentry *child)
+{
+    const struct export_operations *orig;
+    struct inode *inode = d_inode(child);
+
+    if (inode && nm_inode_is_virtual(inode)) return ERR_PTR(-ESTALE);
+    orig = nm_orig_export_ops(child->d_sb);
+    if (!orig || !orig->get_parent) return ERR_PTR(-ESTALE);
+    return orig->get_parent(child);
 }
 
 static int nm_shutdown_sync_fs(struct super_block *sb, int wait)
@@ -1159,6 +1250,7 @@ static int nm_d_revalidate(struct dentry *dentry, unsigned int flags) {
 static const struct dentry_operations nm_dops = {
     .d_revalidate = nm_d_revalidate,
     .d_weak_revalidate = nm_d_weak_revalidate,
+    .d_prune = nm_deferred_dentry_prune,
 };
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
@@ -1232,8 +1324,17 @@ static void nm_install_export_hook(struct nm_sop *nm_sop)
     nm_sop->orig_export_op = sb->s_export_op;
     nm_sop->fake_export_op = *sb->s_export_op;
     nm_sop->fake_export_op.encode_fh = nm_encode_fh;
+    if (nm_sop->fake_export_op.get_parent) nm_sop->fake_export_op.get_parent = nm_export_get_parent;
     smp_store_release(&sb->s_export_op, &nm_sop->fake_export_op);
     nm_debug("export_ops hijacked for dev: 0x%x\n", sb->s_dev);
+}
+
+static bool nm_sop_live_match(struct nm_sop *nm_sop, struct super_block *sb)
+{
+    if (nm_sop->sb != sb || nm_sop->sb_dev != sb->s_dev) return false;
+
+    return (nm_sop->fake_xattr && READ_ONCE(sb->s_xattr) == nm_sop->fake_xattr) ||
+           (nm_sop->orig_export_op && READ_ONCE(sb->s_export_op) == &nm_sop->fake_export_op);
 }
 
 static int nm_hijack_superblock(struct super_block *sb, bool with_xattr)
@@ -1245,12 +1346,30 @@ static int nm_hijack_superblock(struct super_block *sb, bool with_xattr)
         if (!with_xattr && (sb_rdonly(sb) || nm_is_pseudo_fs(sb))) return 0;
         bool kernfs = with_xattr && nm_is_kernfs(sb);
         if (kernfs) {
-            list_for_each_entry(nm_sop, &nm_sb_list, list)
-                if (nm_sop->sb == sb) return 0;
+            struct nm_sop *tmp;
+            list_for_each_entry_safe(nm_sop, tmp, &nm_sb_list, list) {
+                if (nm_sop->sb != sb || nm_sop->sb_dev != sb->s_dev) continue;
+                if (nm_sop_live_match(nm_sop, sb)) {
+                    if ((nm_sop->fake_xattr && sb->s_xattr &&
+                         READ_ONCE(sb->s_xattr) != nm_sop->fake_xattr) ||
+                        (nm_sop->orig_export_op &&
+                         READ_ONCE(sb->s_export_op) != &nm_sop->fake_export_op)) {
+                        nm_unhook_superblock_locked(nm_sop, sb);
+                        break;
+                    }
+                    if (sb->s_xattr && !nm_sop->fake_xattr) goto install_xattr;
+                    return 0;
+                }
+                nm_unhook_superblock_locked(nm_sop, sb);
+                break;
+            }
         }
         if (!(nm_sop = kzalloc(sizeof(*nm_sop), GFP_KERNEL))) return -ENOMEM;
         nm_sop->orig_sop = sb->s_op;
         nm_sop->sb = sb;
+        nm_sop->sb_type = sb->s_type;
+        nm_sop->sb_dev = sb->s_dev;
+        nm_sop->detached_sops = kernfs;
         if (!kernfs) {
             nm_sop->fake_sop = *sb->s_op;
             nm_sop->fake_sop.put_super = nm_hijacked_put_super;
@@ -1261,9 +1380,9 @@ static int nm_hijack_superblock(struct super_block *sb, bool with_xattr)
             if (!sb_rdonly(sb) && !nm_is_pseudo_fs(sb))
                 nm_sop->fake_sop.sync_fs = nm_shutdown_sync_fs;
             smp_store_release(&sb->s_op, &nm_sop->fake_sop);
-            if (with_xattr) nm_install_export_hook(nm_sop);
         }
         list_add_tail_rcu(&nm_sop->list, &nm_sb_list);
+        if (with_xattr) nm_install_export_hook(nm_sop);
         nm_debug("Superblock successfully hijacked for dev: 0x%x\n", sb->s_dev);
     } else if (!with_xattr || nm_sop->fake_xattr) {
         return 0;
@@ -1273,6 +1392,7 @@ static int nm_hijack_superblock(struct super_block *sb, bool with_xattr)
         nm_install_export_hook(nm_sop);
     }
 
+install_xattr:
     if (with_xattr && sb->s_xattr) {
         const struct xattr_handler **new_array;
         struct nm_xattr_proxy *proxies;
@@ -1361,11 +1481,13 @@ static void nm_hijack_dentry_ops(struct inode *dir, struct dentry *dentry, bool 
     if (unlikely(!dentry || !dir)) return;
     iop = nm_get_nm_iop(smp_load_acquire(&dir->i_op));
     orig = READ_ONCE(dentry->d_op);
-    if (unlikely(!injected && !iop && orig) || nm_is_our_dops(iop, orig)) return;
+    if (!injected && (unlikely(!iop && orig) || nm_is_our_dops(iop, orig))) return;
 
     spin_lock(&dentry->d_lock);
     orig = dentry->d_op;
     if (nm_is_our_dops(iop, orig)) {
+        if (injected && orig == &nm_dops && nm_deferred_dentry_get(dentry))
+            smp_store_release(&dentry->d_flags, dentry->d_flags | DCACHE_OP_PRUNE);
         spin_unlock(&dentry->d_lock);
         return;
     }
@@ -1373,6 +1495,7 @@ static void nm_hijack_dentry_ops(struct inode *dir, struct dentry *dentry, bool 
     if (injected || !orig) {
         new_flags = dentry->d_flags & ~DCACHE_OPS;
         new_flags |= (DCACHE_OP_REVALIDATE | DCACHE_OP_WEAK_REVALIDATE);
+        if (injected && nm_deferred_dentry_get(dentry)) new_flags |= DCACHE_OP_PRUNE;
         dentry->d_op = &nm_dops;
         smp_store_release(&dentry->d_flags, new_flags);
     } else if (iop) {
@@ -1410,6 +1533,8 @@ static void nm_clear_dops_sb(struct super_block *sb)
             spin_lock(&dentry->d_lock);
             dop = dentry->d_op;
             if (dop && dop->d_revalidate == nm_d_revalidate) {
+                if (dop == &nm_dops && (dentry->d_flags & DCACHE_OP_PRUNE))
+                    nm_deferred_dentry_prune(dentry);
                 if (dop != &nm_dops)
                     orig = nm_get_orig_dops(container_of(dop, struct nm_dir_ops, fake_dops));
                 if (orig) {
@@ -1440,18 +1565,21 @@ static void nm_sop_rcu_free(struct rcu_head *head)
     kfree(nm_sop);
 }
 
-static void nm_unhook_superblock_locked(struct nm_sop *nm_sop)
+static void nm_forget_superblock_locked(struct nm_sop *nm_sop)
 {
-    struct super_block *sb = nm_sop->sb;
+    list_del_rcu(&nm_sop->list);
+    call_rcu(&nm_sop->rcu, nm_sop_rcu_free);
+}
 
+static void nm_unhook_superblock_locked(struct nm_sop *nm_sop, struct super_block *sb)
+{
     if (READ_ONCE(sb->s_op) == &nm_sop->fake_sop)
         smp_store_release(&sb->s_op, nm_sop->orig_sop);
     if (nm_sop->orig_export_op && READ_ONCE(sb->s_export_op) == &nm_sop->fake_export_op)
         smp_store_release(&sb->s_export_op, nm_sop->orig_export_op);
     if (nm_sop->fake_xattr && READ_ONCE(sb->s_xattr) == nm_sop->fake_xattr)
         smp_store_release((const struct xattr_handler ***)&sb->s_xattr, nm_sop->orig_xattr);
-    list_del_rcu(&nm_sop->list);
-    call_rcu(&nm_sop->rcu, nm_sop_rcu_free);
+    nm_forget_superblock_locked(nm_sop);
 }
 
 static void nm_hijacked_put_super(struct super_block *sb)
@@ -1463,7 +1591,7 @@ static void nm_hijacked_put_super(struct super_block *sb)
     orig_sop = smp_load_acquire(&sb->s_op);
     if ((nm_sop = nm_get_nm_sop(orig_sop))) {
         orig_sop = nm_sop->orig_sop;
-        if (nm_sop->sb == sb) nm_unhook_superblock_locked(nm_sop);
+        if (nm_sop->sb == sb) nm_unhook_superblock_locked(nm_sop, sb);
     }
     mutex_unlock(&nm_mutex);
 
@@ -1471,12 +1599,54 @@ static void nm_hijacked_put_super(struct super_block *sb)
         orig_sop->put_super(sb);
 }
 
+static void nm_pin_kernfs_superblock(struct super_block *sb, void *arg)
+{
+    struct nm_sop *nm_sop = arg;
+
+    if (!nm_sop_live_match(nm_sop, sb)) return;
+
+    /* The iterator holds s_umount shared, blocking final deactivation. */
+    if (atomic_inc_not_zero(&sb->s_active))
+        WRITE_ONCE(nm_sop->restore_sb, sb);
+}
+
+static void nm_prepare_kernfs_restore(void)
+{
+    LIST_HEAD(pending);
+    struct nm_sop *nm_sop, *tmp;
+
+    lockdep_assert_held(&nm_mutex);
+    WRITE_ONCE(nm_shutdown_released, true);
+    list_for_each_entry(nm_sop, &nm_sb_list, list) {
+        if (!nm_sop->detached_sops) continue;
+        nm_sop->restore_sb = NULL;
+        list_add_tail(&nm_sop->restore_link, &pending);
+    }
+
+    /* New rule additions stay blocked while the iterator runs without nm_mutex. */
+    mutex_unlock(&nm_mutex);
+    list_for_each_entry(nm_sop, &pending, restore_link) {
+        if (nm_sop->sb_type)
+            iterate_supers_type(nm_sop->sb_type, nm_pin_kernfs_superblock, nm_sop);
+    }
+    mutex_lock(&nm_mutex);
+
+    list_for_each_entry_safe(nm_sop, tmp, &pending, restore_link)
+        list_del_init(&nm_sop->restore_link);
+}
+
 static void nm_restore_superblocks(void)
 {
     struct nm_sop *nm_sop, *tmp;
     struct inode *inode;
     list_for_each_entry_safe(nm_sop, tmp, &nm_sb_list, list) {
-        struct super_block *sb = nm_sop->sb;
+        bool detached_sops = nm_sop->detached_sops;
+        struct super_block *sb = detached_sops ? nm_sop->restore_sb : nm_sop->sb;
+
+        if (!sb) {
+            nm_forget_superblock_locked(nm_sop);
+            continue;
+        }
 
         nm_clear_dops_sb(sb);
         shrink_dcache_sb(sb);
@@ -1484,8 +1654,9 @@ static void nm_restore_superblocks(void)
         list_for_each_entry(inode, &sb->s_inodes, i_sb_list)
             nm_destroy_hijacked_inode(inode);
         spin_unlock(&sb->s_inode_list_lock);
-        nm_unhook_superblock_locked(nm_sop);
+        nm_unhook_superblock_locked(nm_sop, sb);
         nm_debug("Successfully cured superblock for dev: 0x%x\n", sb->s_dev);
+        if (detached_sops) deactivate_super(sb);
     }
 }
 
@@ -1772,13 +1943,14 @@ static void nm_reclaim(struct work_struct *work)
 {
     struct nm_rule_array *arrays;
     struct nm_leaf *leaves;
+    struct llist_node *infos = llist_del_all(&nm_deferred_infos);
     mutex_lock(&nm_mutex);
     arrays = nm_retired_arrays;
     leaves = nm_retired_leaves;
     nm_retired_arrays = NULL;
     nm_retired_leaves = NULL;
     mutex_unlock(&nm_mutex);
-    if (!arrays && !leaves) return;
+    if (!arrays && !leaves && !infos) return;
 
     synchronize_rcu();
     while (arrays) {
@@ -1791,17 +1963,30 @@ static void nm_reclaim(struct work_struct *work)
         leaves = leaf->next;
         nm_leaf_put(leaf);
     }
+    while (infos) {
+        struct nm_inode_info *info = container_of(infos, struct nm_inode_info, deferred_node);
+        infos = infos->next;
+        nm_virtual_info_free(info);
+    }
 }
 
-static DECLARE_WORK(nm_reclaim_work, nm_reclaim);
+static void nm_drain_reclaim(void)
+{
+    do {
+        flush_work(&nm_reclaim_work);
+        rcu_barrier();
+    } while (work_busy(&nm_reclaim_work) ||
+             !llist_empty(&nm_deferred_infos) ||
+             READ_ONCE(nm_retired_arrays) ||
+             READ_ONCE(nm_retired_leaves));
+}
 
-static bool nm_shutdown_released;
 static void nm_shutdown_release(void)
 {
     if (READ_ONCE(nm_shutdown_released)) return;
     WRITE_ONCE(nm_shutdown_released, true);
     nm_clear_state(NM_CLEAR_UIDS | NM_CLEAR_RULES);
-    flush_work(&nm_reclaim_work);
+    nm_drain_reclaim();
 }
 
 static struct nm_rule_array nm_virtual_parent_rules = {
@@ -2156,7 +2341,10 @@ static void nm_clear_state(int clear_flags)
             nm_retire_leaf_locked(leaf);
         }
     }
-    if (clear_flags & NM_CLEAR_EXIT) nm_restore_superblocks();
+    if (clear_flags & NM_CLEAR_EXIT) {
+        nm_prepare_kernfs_restore();
+        nm_restore_superblocks();
+    }
     mutex_unlock(&nm_mutex);
 }
 
@@ -2384,8 +2572,7 @@ static void __exit nomount_exit(void)
 {
     unregister_key_type(&nm_key_type);
     nm_clear_state(NM_CLEAR_UIDS | NM_CLEAR_RULES | NM_CLEAR_EXIT);
-    flush_work(&nm_reclaim_work);
-    rcu_barrier();
+    nm_drain_reclaim();
     nm_info("Unloaded successfully\n");
 }
 
