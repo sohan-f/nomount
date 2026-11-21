@@ -85,7 +85,6 @@ struct nm_sop {
 struct nm_inode_info {
     struct path r_path;
     union { struct nm_dir_node *dir_node; struct nm_leaf *leaf; const void *node; };
-    struct file *r_file;
     struct inode *inode;
     atomic_t deferred_refs;
     struct llist_node deferred_node;
@@ -209,6 +208,8 @@ static void nm_hijack_dentry_ops(struct inode *dir, struct dentry *dentry, bool 
 static void nm_dir_put(struct nm_dir_node *dir_node);
 static void nm_leaf_put(struct nm_leaf *leaf);
 static void nm_shutdown_release(void);
+static void nm_shutdown_evict(void);
+static void nm_drain_reclaim(void);
 static int nm_del_rule_locked(const char *path, u16 len, unsigned int uid, unsigned int uid_end, unsigned int deny_start, unsigned int deny_end);
 static void nm_clear_state(int clear_flags);
 

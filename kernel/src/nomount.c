@@ -5,6 +5,7 @@
 #include <linux/cred.h>
 #include <linux/xattr.h>
 #include <linux/module.h>
+#include <linux/wait.h>
 #include "nomount.h"
 
 /*** Helpers ***/
@@ -188,6 +189,22 @@ static void nm_reclaim(struct work_struct *work);
 static DECLARE_WORK(nm_reclaim_work, nm_reclaim);
 static LLIST_HEAD(nm_deferred_infos);
 static bool nm_shutdown_released;
+static atomic_t nm_active_operations = ATOMIC_INIT(0);
+static DECLARE_WAIT_QUEUE_HEAD(nm_shutdown_wait);
+static DEFINE_MUTEX(nm_lifecycle_mutex);
+static struct task_struct *nm_lifecycle_owner;
+
+static void nm_lifecycle_lock(void)
+{
+    mutex_lock(&nm_lifecycle_mutex);
+    WRITE_ONCE(nm_lifecycle_owner, current);
+}
+
+static void nm_lifecycle_unlock(void)
+{
+    WRITE_ONCE(nm_lifecycle_owner, NULL);
+    mutex_unlock(&nm_lifecycle_mutex);
+}
 
 static void nm_dir_rcu_free(struct rcu_head *head)
 {
@@ -205,7 +222,6 @@ static void nm_dir_put(struct nm_dir_node *dir_node)
 
 static void nm_virtual_info_free(struct nm_inode_info *info)
 {
-    if (info->r_file) fput(info->r_file);
     if (info->is_dir) nm_dir_put(info->dir_node);
     else nm_leaf_put(info->leaf);
     if (info->r_path.dentry) path_put(&info->r_path);
@@ -249,6 +265,28 @@ static void nm_deferred_dentry_prune(struct dentry *dentry)
 {
     struct nm_inode_info *info = xchg(&dentry->d_fsdata, NULL);
     if (info) nm_deferred_put(info);
+}
+
+static bool nm_operation_enter(void)
+{
+    if (READ_ONCE(nm_shutdown_released)) return false;
+    atomic_inc(&nm_active_operations);
+    smp_mb__after_atomic();
+    if (likely(!READ_ONCE(nm_shutdown_released))) return true;
+    if (atomic_dec_and_test(&nm_active_operations)) wake_up_all(&nm_shutdown_wait);
+    return false;
+}
+
+static void nm_operation_exit(void)
+{
+    if (atomic_dec_and_test(&nm_active_operations)) wake_up_all(&nm_shutdown_wait);
+}
+
+static void nm_block_new_operations(void)
+{
+    WRITE_ONCE(nm_shutdown_released, true);
+    smp_mb();
+    wait_event(nm_shutdown_wait, atomic_read(&nm_active_operations) == 0);
 }
 
 static inline void nm_destroy_hijacked_inode(struct inode *inode)
@@ -517,7 +555,7 @@ out:
 }
 
 /*** i_op / s_op / f_op Hijacking Hooks ***/
-static struct dentry *nm_hijacked_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
+static struct dentry *nm_hijacked_lookup_inner(struct inode *dir, struct dentry *dentry, unsigned int flags)
 {
     const struct inode_operations *orig_iop;
     struct nm_rule_info rule_info = {0};
@@ -549,6 +587,16 @@ static struct dentry *nm_hijacked_lookup(struct inode *dir, struct dentry *dentr
         return res;
     }
     return ERR_PTR(-EOPNOTSUPP);
+}
+
+static struct dentry *nm_hijacked_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
+{
+    struct dentry *res;
+
+    if (!nm_operation_enter()) return ERR_PTR(-ESHUTDOWN);
+    res = nm_hijacked_lookup_inner(dir, dentry, flags);
+    nm_operation_exit();
+    return res;
 }
 
 static int nm_iterate_view(struct file *file, struct dir_context *ctx, const struct file_operations *fop,
@@ -743,40 +791,41 @@ static int nm_open(struct inode *inode, struct file *file)
 {
     struct nm_inode_info *info = inode->i_private;
     struct file *real_file;
+    int ret;
 
-    if (unlikely(!info)) return -ENODEV;
+    if (!nm_operation_enter()) return -ESHUTDOWN;
+    if (unlikely(!info)) {
+        ret = -ENODEV;
+        goto out;
+    }
     if (unlikely(!info->r_path.dentry)) {
         file->private_data = NULL;
-        if (info->deferred_evict) atomic_inc(&info->deferred_refs);
-        return 0;
-    }
-
-    bool readonly = (file->f_flags & ~(O_LARGEFILE | O_CLOEXEC)) == O_RDONLY;
-    if (readonly && (real_file = smp_load_acquire(&info->r_file)) && real_file->f_cred == file->f_cred) {
-        if (!S_ISDIR(inode->i_mode)) nm_sync_inode_size(inode, file_inode(real_file));
-        file->private_data = real_file;
-        if (info->deferred_evict) atomic_inc(&info->deferred_refs);
-        return 0;
+        ret = 0;
+        goto opened;
     }
 
     real_file = dentry_open(&info->r_path, (file->f_flags & ~(O_CREAT | O_EXCL | O_NOCTTY)), file->f_cred);
-    if (IS_ERR(real_file)) return PTR_ERR(real_file);
+    if (IS_ERR(real_file)) {
+        ret = PTR_ERR(real_file);
+        goto out;
+    }
 
     if (!S_ISDIR(inode->i_mode)) nm_sync_inode_size(inode, file_inode(real_file));
     file->private_data = real_file;
-    if (readonly && !READ_ONCE(info->r_file) && S_ISREG(inode->i_mode)) {
-        unsigned long magic = info->r_path.dentry->d_sb->s_magic;
-        if (magic == EXT4_SUPER_MAGIC || magic == F2FS_SUPER_MAGIC) cmpxchg(&info->r_file, NULL, real_file);
-    }
+    ret = 0;
+
+opened:
     if (info->deferred_evict) atomic_inc(&info->deferred_refs);
-    return 0;
+out:
+    nm_operation_exit();
+    return ret;
 }
 
 static int nm_release(struct inode *inode, struct file *file)
 {
     struct nm_inode_info *info = READ_ONCE(inode->i_private);
     struct file *real_file = file->private_data;
-    if (real_file && info && real_file != READ_ONCE(info->r_file)) fput(real_file);
+    if (real_file) fput(real_file);
     file->private_data = NULL;
     if (info && info->deferred_evict) nm_deferred_put(info);
     return 0;
@@ -1000,7 +1049,7 @@ static int nm_dir_iterate_dir(struct file *file, struct dir_context *ctx)
     return nm_iterate_view(file, ctx, real_file ? real_file->f_op : NULL, info->dir_node, false, info->opaque);
 }
 
-static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
+static struct dentry *nm_dir_lookup_inner(struct inode *dir, struct dentry *dentry, unsigned int flags)
 {
     struct nm_inode_info *info = dir->i_private;
     struct nm_rule_info rule_info = {0};
@@ -1054,6 +1103,16 @@ negative_dentry:
     nm_hijack_dentry_ops(dir, dentry, true);
     d_add(dentry, NULL);
     return NULL;
+}
+
+static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
+{
+    struct dentry *res;
+
+    if (!nm_operation_enter()) return ERR_PTR(-ESHUTDOWN);
+    res = nm_dir_lookup_inner(dir, dentry, flags);
+    nm_operation_exit();
+    return res;
 }
 
 struct nm_xattr_proxy {
@@ -1247,10 +1306,19 @@ static int nm_d_revalidate(struct dentry *dentry, unsigned int flags) {
 }
 #endif
 
+static void nm_d_release(struct dentry *dentry)
+{
+    if (likely(!READ_ONCE(nm_shutdown_released)) || READ_ONCE(nm_lifecycle_owner) == current) return;
+    nm_lifecycle_lock();
+    nm_drain_reclaim();
+    nm_lifecycle_unlock();
+}
+
 static const struct dentry_operations nm_dops = {
     .d_revalidate = nm_d_revalidate,
     .d_weak_revalidate = nm_d_weak_revalidate,
     .d_prune = nm_deferred_dentry_prune,
+    .d_release = nm_d_release,
 };
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
@@ -1981,12 +2049,62 @@ static void nm_drain_reclaim(void)
              READ_ONCE(nm_retired_leaves));
 }
 
+static void nm_drop_virtual_dentries(struct super_block *sb)
+{
+    struct inode *inode;
+    struct dentry *dentry;
+
+    spin_lock(&sb->s_inode_list_lock);
+    list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
+        if (!nm_inode_is_virtual(inode)) continue;
+        spin_lock(&inode->i_lock);
+        for_each_alias(dentry, inode)
+            d_drop(dentry);
+        spin_unlock(&inode->i_lock);
+    }
+    spin_unlock(&sb->s_inode_list_lock);
+}
+
+static void nm_shrink_virtual_dentries(void)
+{
+    struct nm_sop *nm_sop;
+
+    lockdep_assert_held(&nm_mutex);
+    nm_prepare_kernfs_restore();
+    list_for_each_entry(nm_sop, &nm_sb_list, list) {
+        bool detached_sops = nm_sop->detached_sops;
+        struct super_block *sb = detached_sops ? nm_sop->restore_sb : nm_sop->sb;
+
+        if (!sb) continue;
+        nm_drop_virtual_dentries(sb);
+        shrink_dcache_sb(sb);
+        if (detached_sops) {
+            deactivate_super(sb);
+            nm_sop->restore_sb = NULL;
+        }
+    }
+}
+
+static void nm_shutdown_evict(void)
+{
+    lockdep_assert_held(&nm_lifecycle_mutex);
+    mutex_lock(&nm_mutex);
+    nm_shrink_virtual_dentries();
+    mutex_unlock(&nm_mutex);
+    nm_drain_reclaim();
+}
+
 static void nm_shutdown_release(void)
 {
-    if (READ_ONCE(nm_shutdown_released)) return;
-    WRITE_ONCE(nm_shutdown_released, true);
+    nm_lifecycle_lock();
+    if (READ_ONCE(nm_shutdown_released)) {
+        nm_lifecycle_unlock();
+        return;
+    }
+    nm_block_new_operations();
     nm_clear_state(NM_CLEAR_UIDS | NM_CLEAR_RULES);
-    nm_drain_reclaim();
+    nm_shutdown_evict();
+    nm_lifecycle_unlock();
 }
 
 static struct nm_rule_array nm_virtual_parent_rules = {
@@ -2570,9 +2688,12 @@ static int __init nomount_init(void)
 
 static void __exit nomount_exit(void)
 {
+    nm_lifecycle_lock();
+    nm_block_new_operations();
     unregister_key_type(&nm_key_type);
     nm_clear_state(NM_CLEAR_UIDS | NM_CLEAR_RULES | NM_CLEAR_EXIT);
     nm_drain_reclaim();
+    nm_lifecycle_unlock();
     nm_info("Unloaded successfully\n");
 }
 
