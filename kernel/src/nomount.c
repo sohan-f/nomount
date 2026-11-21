@@ -433,6 +433,7 @@ static void nm_init_prealloc_inode(struct inode *inode, struct nm_inode_info *in
     }
     inode->i_flags |= S_PRIVATE | S_NOATIME | S_NOCMTIME | S_NOSEC;
     if (!S_ISLNK(inode->i_mode)) inode->i_opflags |= IOP_NOFOLLOW;
+    if (!S_ISDIR(inode->i_mode)) clear_nlink(inode);
 }
 
 static bool nm_inode_matches_attrs(struct inode *inode, struct inode *r_inode)
