@@ -168,6 +168,7 @@ static void nm_reclaim(struct work_struct *work);
 static DECLARE_WORK(nm_reclaim_work, nm_reclaim);
 static LLIST_HEAD(nm_deferred_infos);
 static bool nm_shutdown_released;
+static bool nm_module_pinned;
 static atomic_t nm_active_operations = ATOMIC_INIT(0);
 static DECLARE_WAIT_QUEUE_HEAD(nm_shutdown_wait);
 static DEFINE_MUTEX(nm_lifecycle_mutex);
@@ -1397,6 +1398,10 @@ static int nm_hijack_superblock(struct super_block *sb, bool with_xattr)
 
     if (!nm_sop) {
         if (!with_xattr && (sb_rdonly(sb) || nm_is_pseudo_fs(sb))) return 0;
+        if (!nm_module_pinned) {
+            if (!try_module_get(THIS_MODULE)) return -EAGAIN;
+            nm_module_pinned = true;
+        }
         bool kernfs = with_xattr && nm_is_kernfs(sb);
         if (kernfs) {
             struct nm_sop *tmp;
