@@ -647,40 +647,15 @@ static int nm_hijacked_unlink(struct inode *dir, struct dentry *dentry)
 {
     const struct inode_operations *orig_iop;
     struct nm_dir_ops *nm_iop;
-    struct nm_dir_node *dir_node;
-    struct nm_leaf *leaf;
-    struct nm_rule *rule;
     struct inode *inode = d_inode(dentry);
-    uid_t fsuid = current_fsuid().val;
-    int ret;
 
     if (unlikely(!inode))
         return -ENOENT;
+    if (nm_inode_is_virtual(inode)) return -ENOENT;
 
     orig_iop = smp_load_acquire(&dir->i_op);
     if ((nm_iop = nm_get_nm_iop(orig_iop)))
         orig_iop = nm_iop->orig_iop;
-    if (unlikely(!nm_iop || !nm_inode_is_virtual(inode) || nm_is_uid_blocked(fsuid)))
-        goto do_real_unlink;
-
-    if (!mutex_trylock(&nm_mutex)) return -EBUSY;
-    dir_node = rcu_dereference_protected(nm_iop->dir_node, lockdep_is_held(&nm_mutex));
-    leaf = nm_find_leaf_in_dir(dir_node, dentry->d_name.name, dentry->d_name.len);
-    if (unlikely(!leaf || !(rule = nm_select_rule(leaf, fsuid)) || (!rule->target_uid && !rule->uid_end))) {
-        mutex_unlock(&nm_mutex);
-        goto do_real_unlink;
-    }
-
-    ret = nm_del_rule_locked(leaf->paths, leaf->v_len, rule->target_uid, rule->uid_end, rule->deny_start, rule->deny_end);
-    mutex_unlock(&nm_mutex);
-    if (ret)
-        return ret;
-
-    d_drop(dentry);
-    return 0;
-
-do_real_unlink:
-    if (nm_inode_is_virtual(inode)) return -ENOENT;
     if (orig_iop && orig_iop->unlink)
         return orig_iop->unlink(dir, dentry);
     return -EPERM;
