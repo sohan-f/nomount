@@ -2349,8 +2349,9 @@ static int nm_add_rule_locked(const char *v_path, const char *r_path, u16 v_len,
     } else {
         while (pos < count && (old->rules[pos].target_uid < uid || (old->rules[pos].target_uid == uid && old->rules[pos].uid_end < uid_end))) pos++;
         replace = pos < count && old->rules[pos].target_uid == uid && old->rules[pos].uid_end == uid_end;
-        if (!replace && old) {
+        if (old) {
             for (int i = count - old->uid_count; i < count; i++) {
+                if (replace && i == pos) continue;
                 if (nm_rules_overlap(&old->rules[i], &new_rule)) { err = -EEXIST; goto out_leaf; }
             }
         }
