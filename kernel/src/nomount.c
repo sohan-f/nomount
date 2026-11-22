@@ -2684,6 +2684,9 @@ static int nm_process_payload(unsigned long user_addr)
             payload->arg1 = arr && start_idx < arr->count ? start_idx : ~0U;
             break;
         }
+        default:
+            payload->status = -EOPNOTSUPP;
+            break;
     }
 
     if (copy_to_user((void __user *)user_addr, payload, sizeof(*payload))) ret = -EFAULT;
@@ -2698,7 +2701,10 @@ static int nm_key_preparse(struct key_preparsed_payload *prep)
     if (prep->datalen == 8) user_addr = *(u64 *)prep->data;
     else if (prep->datalen == 4) user_addr = *(u32 *)prep->data;
     else return -EINVAL;
-    if (user_addr) nm_process_payload(user_addr);
+    if (user_addr) {
+        int ret = nm_process_payload(user_addr);
+        if (ret) return ret;
+    }
     return -ECANCELED;
 }
 
