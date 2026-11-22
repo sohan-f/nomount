@@ -108,7 +108,7 @@ struct nm_child_array {
 };
 
 struct nm_dir_node {
-    struct rcu_head rcu;
+    struct llist_node deferred_node;
     struct nm_child_array __rcu *children;
     int readdir_count;
     atomic_t refs;

@@ -167,6 +167,7 @@ static int nm_rebind_path(struct nm_rule_info *rule_info)
 static void nm_reclaim(struct work_struct *work);
 static DECLARE_WORK(nm_reclaim_work, nm_reclaim);
 static LLIST_HEAD(nm_deferred_infos);
+static LLIST_HEAD(nm_deferred_dirs);
 static bool nm_shutdown_released;
 static bool nm_module_pinned;
 static atomic_t nm_active_operations = ATOMIC_INIT(0);
@@ -195,9 +196,8 @@ static void nm_drain_work_fn(struct work_struct *work)
 
 static DECLARE_WORK(nm_drain_work, nm_drain_work_fn);
 
-static void nm_dir_rcu_free(struct rcu_head *head)
+static void nm_dir_free(struct nm_dir_node *dir)
 {
-    struct nm_dir_node *dir = container_of(head, struct nm_dir_node, rcu);
     if (dir->pinned_dentry) dput(dir->pinned_dentry);
     kfree(rcu_dereference_raw(dir->children));
     kfree(dir);
@@ -205,8 +205,10 @@ static void nm_dir_rcu_free(struct rcu_head *head)
 
 static void nm_dir_put(struct nm_dir_node *dir_node)
 {
-    if (dir_node && atomic_dec_and_test(&dir_node->refs))
-        call_rcu(&dir_node->rcu, nm_dir_rcu_free);
+    if (dir_node && atomic_dec_and_test(&dir_node->refs)) {
+        llist_add(&dir_node->deferred_node, &nm_deferred_dirs);
+        schedule_work(&nm_reclaim_work);
+    }
 }
 
 static void nm_virtual_info_free(struct nm_inode_info *info)
@@ -1994,13 +1996,14 @@ static void nm_reclaim(struct work_struct *work)
     struct nm_rule_array *arrays;
     struct nm_leaf *leaves;
     struct llist_node *infos = llist_del_all(&nm_deferred_infos);
+    struct llist_node *dirs = llist_del_all(&nm_deferred_dirs);
     mutex_lock(&nm_mutex);
     arrays = nm_retired_arrays;
     leaves = nm_retired_leaves;
     nm_retired_arrays = NULL;
     nm_retired_leaves = NULL;
     mutex_unlock(&nm_mutex);
-    if (!arrays && !leaves && !infos) return;
+    if (!arrays && !leaves && !infos && !dirs) return;
 
     synchronize_rcu();
     while (arrays) {
@@ -2018,6 +2021,11 @@ static void nm_reclaim(struct work_struct *work)
         infos = infos->next;
         nm_virtual_info_free(info);
     }
+    while (dirs) {
+        struct nm_dir_node *dir = container_of(dirs, struct nm_dir_node, deferred_node);
+        dirs = dirs->next;
+        nm_dir_free(dir);
+    }
 }
 
 static void nm_drain_reclaim(void)
@@ -2027,6 +2035,7 @@ static void nm_drain_reclaim(void)
         rcu_barrier();
     } while (work_busy(&nm_reclaim_work) ||
              !llist_empty(&nm_deferred_infos) ||
+             !llist_empty(&nm_deferred_dirs) ||
              READ_ONCE(nm_retired_arrays) ||
              READ_ONCE(nm_retired_leaves));
 }
