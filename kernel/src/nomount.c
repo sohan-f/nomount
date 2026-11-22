@@ -927,6 +927,7 @@ static ssize_t nm_splice_read(struct file *in, loff_t *ppos, struct pipe_inode_i
     if (!real_file) return -EINVAL;
     if (real_file->f_op->splice_read)
         return real_file->f_op->splice_read(real_file, ppos, pipe, len, flags);
+    if (!real_file->f_op->read_iter) return -EINVAL;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
     return copy_splice_read(real_file, ppos, pipe, len, flags);
 #else
