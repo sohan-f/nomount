@@ -924,17 +924,27 @@ static ssize_t nm_splice_read(struct file *in, loff_t *ppos, struct pipe_inode_i
                               size_t len, unsigned int flags)
 {
     struct file *real_file = in->private_data;
-    if (!real_file || !real_file->f_op->splice_read) return -EINVAL;
-    return real_file->f_op->splice_read(real_file, ppos, pipe, len, flags);
+    if (!real_file) return -EINVAL;
+    if (real_file->f_op->splice_read)
+        return real_file->f_op->splice_read(real_file, ppos, pipe, len, flags);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
+    return copy_splice_read(real_file, ppos, pipe, len, flags);
+#else
+    return generic_file_splice_read(real_file, ppos, pipe, len, flags);
+#endif
 }
 
 static ssize_t nm_splice_write(struct pipe_inode_info *pipe, struct file *out,
                                loff_t *ppos, size_t len, unsigned int flags)
 {
     struct file *real_file = out->private_data;
-    if (!real_file || !real_file->f_op->splice_write) return -EINVAL;
+    if (!real_file) return -EINVAL;
     bool real_write = nm_real_start_write(out, real_file);
-    ssize_t ret = real_file->f_op->splice_write(pipe, real_file, ppos, len, flags);
+    ssize_t ret;
+    if (real_file->f_op->splice_write)
+        ret = real_file->f_op->splice_write(pipe, real_file, ppos, len, flags);
+    else
+        ret = iter_file_splice_write(pipe, real_file, ppos, len, flags);
     nm_real_end_write(real_file, real_write);
     return ret;
 }
