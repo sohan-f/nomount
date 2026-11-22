@@ -856,6 +856,18 @@ static ssize_t nm_read_iter(struct kiocb *iocb, struct iov_iter *to)
     return ret;
 }
 
+static inline bool nm_real_start_write(struct file *file, struct file *real_file)
+{
+    if (file_inode(file)->i_sb == file_inode(real_file)->i_sb) return false;
+    file_start_write(real_file);
+    return true;
+}
+
+static inline void nm_real_end_write(struct file *real_file, bool real_write)
+{
+    if (real_write) file_end_write(real_file);
+}
+
 static ssize_t nm_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
     struct file *file = iocb->ki_filp;
@@ -864,10 +876,12 @@ static ssize_t nm_write_iter(struct kiocb *iocb, struct iov_iter *from)
     if (!real_file || !real_file->f_op->write_iter) return -EINVAL;
     if (unlikely(!is_sync_kiocb(iocb) && (iocb->ki_flags & IOCB_DIRECT))) return -EOPNOTSUPP;
 
+    bool real_write = nm_real_start_write(file, real_file);
     iocb->ki_filp = real_file;
     ret = real_file->f_op->write_iter(iocb, from);
     iocb->ki_filp = file;
     if (ret > 0) nm_sync_inode_size(file_inode(file), file_inode(real_file));
+    nm_real_end_write(real_file, real_write);
 
     return ret;
 }
@@ -928,7 +942,10 @@ static ssize_t nm_splice_write(struct pipe_inode_info *pipe, struct file *out,
 {
     struct file *real_file = out->private_data;
     if (!real_file || !real_file->f_op->splice_write) return -EINVAL;
-    return real_file->f_op->splice_write(pipe, real_file, ppos, len, flags);
+    bool real_write = nm_real_start_write(out, real_file);
+    ssize_t ret = real_file->f_op->splice_write(pipe, real_file, ppos, len, flags);
+    nm_real_end_write(real_file, real_write);
+    return ret;
 }
 
 static int nm_fsync(struct file *file, loff_t start, loff_t end, int datasync)
