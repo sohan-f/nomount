@@ -4,6 +4,76 @@
 #include "nm.h"
 #include <sys/file.h>
 
+static void nm_list_emit(struct nm_output *output, const struct nm_args *args,
+                         const struct nm_list_iter *it, int *offset) {
+    const struct nm_rule_hdr *h = &it->h;
+    unsigned int flags = h->flags, uid = h->uid, uid_end = h->uid_end;
+    unsigned int deny_start = h->deny_start, deny_end = h->deny_end;
+    unsigned short vlen = h->v_len, rlen = h->r_len;
+    int is_white_flag = flags & NM_FLAG_WHITEOUT;
+    int is_virtual_dir = flags & NM_FLAG_VIRTUAL_DIR;
+    int is_opaque = flags & NM_FLAG_OPAQUE;
+
+    if (args->is_json) {
+        list_print_literal_offset(output, ",\n  {\n    \"virtual\": \"", *offset);
+        *offset = 0;
+        list_print_json_strn(output, it->v, vlen);
+        if (is_white_flag) list_print_literal(output, "\",\n    \"whiteout\": true");
+        else if (is_virtual_dir) list_print_literal(output, "\",\n    \"virtual_dir\": true");
+        else {
+            list_print_literal(output, "\",\n    \"real\": \"");
+            list_print_json_strn(output, it->r, rlen);
+            list_print_literal(output, "\"");
+            if (is_opaque) list_print_literal(output, ",\n    \"opaque\": true");
+        }
+        if (uid || uid_end || deny_start || deny_end) {
+            if (uid == 0 && uid_end == 0) list_print_literal(output, ",\n    \"default\": true");
+            else {
+                list_print_literal(output, ",\n    \"uid\": ");
+                list_print_uint(output, uid);
+                list_print_literal(output, ",\n    \"uid_end\": ");
+                list_print_uint(output, uid_end);
+            }
+            if (deny_start) {
+                list_print_literal(output, ",\n    \"deny_start\": ");
+                list_print_uint(output, deny_start);
+                list_print_literal(output, ",\n    \"deny_end\": ");
+                list_print_uint(output, deny_end);
+            }
+        }
+        list_print_literal(output, "\n  }");
+    } else {
+        list_print_strn(output, it->v, vlen);
+        if (is_white_flag) list_print_literal(output, " (whiteout)");
+        else if (is_virtual_dir) list_print_literal(output, " (virtual dir)");
+        else {
+            list_print_literal(output, " -> ");
+            list_print_strn(output, it->r, rlen);
+            if (is_opaque) list_print_literal(output, " (opaque)");
+        }
+        if (uid || uid_end) {
+            list_print_literal(output, " [UID: ");
+            if (uid == uid_end) list_print_uint(output, uid);
+            else {
+                list_print_uint(output, uid);
+                list_print_literal(output, "-");
+                list_print_uint(output, uid_end);
+            }
+            if (deny_start) {
+                list_print_literal(output, " excl ");
+                if (deny_start == deny_end) list_print_uint(output, deny_start);
+                else {
+                    list_print_uint(output, deny_start);
+                    list_print_literal(output, "-");
+                    list_print_uint(output, deny_end);
+                }
+            }
+            list_print_literal(output, "]");
+        }
+        list_print_literal(output, "\n");
+    }
+}
+
 /* --- MAIN --- */
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--try-lock")) {
@@ -172,73 +242,37 @@ int main(int argc, char **argv) {
 
             payload->cmd = is_uids ? NM_CMD_GET_UIDS : NM_CMD_GET_LIST;
             payload->arg1 = 0;
+            payload->target_uid = 0;
+            struct nm_list_iter it = {0};
             do {
                 exit_code = (nm_send_payload(payload) < 0);
                 if (exit_code || payload->data_size == 0) break;
 
                 char *data = payload->buffer;
-                int pos = 0;
+                unsigned int pos = 0;
                 while (pos < payload->data_size) {
                     if (is_uids) {
+                        if (payload->data_size - pos < sizeof(unsigned int)) {
+                            exit_code = nm_error("uid list", -EIO);
+                            payload->arg1 = ~0U;
+                            break;
+                        }
                         unsigned int uid = *(unsigned int *)(data + pos);
                         pos += 4;
                         if (offset == 0) list_print_literal(&output, ",\n");
                         list_print_literal(&output, "  "); list_print_uint(&output, uid);
                         offset = 0;
                     } else {
-                        struct nm_rule_hdr *h = (void *)(data + pos);
-                        unsigned int flags = h->flags, uid = h->uid, uid_end = h->uid_end;
-                        unsigned int deny_start = h->deny_start, deny_end = h->deny_end;
-                        unsigned short vlen = h->v_len, rlen = h->r_len;
-                        pos += sizeof(*h);
-
-                        char *v = data + pos; pos += vlen;
-                        char *r = data + pos; pos += rlen;
-                        int is_white_flag  = (flags & NM_FLAG_WHITEOUT);
-                        int is_virtual_dir = (flags & NM_FLAG_VIRTUAL_DIR);
-                        int is_opaque      = (flags & NM_FLAG_OPAQUE);
-
-                        if (args.is_json) {
-                            list_print_literal_offset(&output, ",\n  {\n    \"virtual\": \"", offset); offset = 0;
-                            list_print_json_strn(&output, v, vlen);
-                            if (is_white_flag) list_print_literal(&output, "\",\n    \"whiteout\": true");
-                            else if (is_virtual_dir) list_print_literal(&output, "\",\n    \"virtual_dir\": true");
-                            else {
-                                list_print_literal(&output, "\",\n    \"real\": \""); list_print_json_strn(&output, r, rlen); list_print_literal(&output, "\"");
-                                if (is_opaque) list_print_literal(&output, ",\n    \"opaque\": true");
-                            }
-                            if (uid || uid_end || deny_start || deny_end) {
-                                if (uid == 0 && uid_end == 0) list_print_literal(&output, ",\n    \"default\": true");
-                                else {
-                                    list_print_literal(&output, ",\n    \"uid\": "); list_print_uint(&output, uid);
-                                    list_print_literal(&output, ",\n    \"uid_end\": "); list_print_uint(&output, uid_end);
-                                }
-                                if (deny_start) {
-                                    list_print_literal(&output, ",\n    \"deny_start\": "); list_print_uint(&output, deny_start);
-                                    list_print_literal(&output, ",\n    \"deny_end\": "); list_print_uint(&output, deny_end);
-                                }
-                            }
-                            list_print_literal(&output, "\n  }");
-                        } else {
-                            list_print_strn(&output, v, vlen);
-                            if (is_white_flag) list_print_literal(&output, " (whiteout)");
-                            else if (is_virtual_dir) list_print_literal(&output, " (virtual dir)");
-                            else {
-                                list_print_literal(&output, " -> "); list_print_strn(&output, r, rlen);
-                                if (is_opaque) list_print_literal(&output, " (opaque)");
-                            }
-                            if (uid || uid_end) {
-                                list_print_literal(&output, " [UID: ");
-                                if (uid == uid_end) list_print_uint(&output, uid);
-                                else { list_print_uint(&output, uid); list_print_literal(&output, "-"); list_print_uint(&output, uid_end); }
-                                if (deny_start) {
-                                    list_print_literal(&output, " excl ");
-                                    if (deny_start == deny_end) list_print_uint(&output, deny_start);
-                                    else { list_print_uint(&output, deny_start); list_print_literal(&output, "-"); list_print_uint(&output, deny_end); }
-                                }
-                                list_print_literal(&output, "]");
-                            }
-                            list_print_literal(&output, "\n");
+                        pos = 0;
+                        int next;
+                        while ((next = nm_list_next(&it, payload, &pos)) > 0) {
+                            nm_list_emit(&output, &args, &it, &offset);
+                            if (payload->arg1 == ~0U && pos == 0) { next = 0; break; }
+                        }
+                        if (next < 0) {
+                            exit_code = nm_error("rule list", -EIO);
+                            payload->arg1 = ~0U;
+                            break;
                         }
                     }
                 }

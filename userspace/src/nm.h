@@ -84,6 +84,62 @@ struct nm_rule_hdr {
     unsigned short r_len;
 } __attribute__((packed));
 
+#define NM_LIST_CONTINUATION (1U << 31)
+
+struct nm_list_iter {
+    struct nm_rule_hdr h;
+    char v[PATH_MAX];
+    char r[PATH_MAX];
+    unsigned int have_r;
+    unsigned int started;
+};
+
+static inline int nm_list_is_cont(const struct nm_payload *p) {
+    return p->arg1 & NM_LIST_CONTINUATION;
+}
+
+static int nm_list_next(struct nm_list_iter *it, const struct nm_payload *p, unsigned int *pos) {
+    if (it->started && nm_list_is_cont(p)) {
+        if (!p->data_size || *pos || p->target_uid != it->have_r || it->have_r > it->h.r_len) return -EPROTO;
+        unsigned int left = it->h.r_len - it->have_r;
+        if (p->data_size > left) return -EPROTO;
+        memcpy(it->r + it->have_r, p->buffer, p->data_size);
+        it->have_r += p->data_size;
+        *pos = 0;
+        if (it->have_r == it->h.r_len) {
+            it->have_r = 0;
+            it->started = 0;
+            *pos = p->data_size;
+            return 1;
+        }
+        return 0;
+    }
+
+    if (*pos >= p->data_size) return 0;
+    if (p->data_size - *pos < sizeof(it->h)) return -EPROTO;
+    it->h = *(struct nm_rule_hdr *)(p->buffer + *pos);
+    it->started = 1;
+    *pos += sizeof(it->h);
+    if (it->h.v_len >= PATH_MAX || it->h.r_len >= PATH_MAX) return -EPROTO;
+    if (p->data_size - *pos < it->h.v_len) return -EPROTO;
+    memcpy(it->v, p->buffer + *pos, it->h.v_len);
+    *pos += it->h.v_len;
+
+    unsigned int avail = p->data_size - *pos;
+    unsigned int n = avail < it->h.r_len ? avail : it->h.r_len;
+    if (n) memcpy(it->r, p->buffer + *pos, n);
+    *pos += n;
+    it->have_r = n;
+    if (n == it->h.r_len) {
+        it->have_r = 0;
+        it->started = 0;
+        return 1;
+    }
+    if (!nm_list_is_cont(p) || p->target_uid != n) return -EPROTO;
+    *pos = 0;
+    return 0;
+}
+
 struct nm_del_hdr {
     unsigned int uid;
     unsigned int uid_end;
@@ -794,10 +850,12 @@ static int cmd_module_list(struct nm_workspace *ws, struct nm_args *args) {
     if (!d) return nm_error("module list", -errno);
     struct nm_output out = { ws->cwd, 0, STDOUT_FILENO };
     struct nm_catalog cat = { 0 };
+    struct nm_list_iter it = {0};
     const char *targets = args->mod_targets ? args->mod_targets : NM_DEFAULT_TARGETS;
 
     ws->payload.cmd = NM_CMD_GET_LIST;
     ws->payload.arg1 = 0;
+    ws->payload.target_uid = 0;
     int rc = nm_send_payload(&ws->payload);
     while (!rc) {
         errno = 0;
@@ -833,18 +891,14 @@ static int cmd_module_list(struct nm_workspace *ws, struct nm_args *args) {
     }
     closedir(d);
 
-    while (!rc && ws->payload.data_size) {
-        char *data = ws->payload.buffer;
-        int pos = 0;
-        while (pos < (int)ws->payload.data_size) {
-            struct nm_rule_hdr *h = (void *)(data + pos);
-            unsigned short vlen = h->v_len, rlen = h->r_len;
-            pos += sizeof(*h);
-            char *v = data + pos; pos += vlen;
-            char *r = data + pos; pos += rlen;
-            if (vlen >= PATH_MAX || rlen >= PATH_MAX) continue;
-            nm_catalog_count(&cat, v, vlen, r, rlen);
+    while (!rc) {
+        unsigned int pos = 0;
+        int next;
+        while ((next = nm_list_next(&it, &ws->payload, &pos)) > 0) {
+            nm_catalog_count(&cat, it.v, it.h.v_len, it.r, it.h.r_len);
+            if (ws->payload.arg1 == ~0U && pos == 0) { next = 0; break; }
         }
+        if (next < 0) { rc = next; break; }
         if (ws->payload.arg1 == ~0U) break;
         rc = nm_send_payload(&ws->payload);
     }
