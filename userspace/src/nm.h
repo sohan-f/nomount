@@ -95,21 +95,25 @@ struct nm_list_iter {
 };
 
 static inline int nm_list_is_cont(const struct nm_payload *p) {
-    return p->arg1 & NM_LIST_CONTINUATION;
+    return p->arg1 != ~0U && (p->arg1 & NM_LIST_CONTINUATION);
 }
 
 static int nm_list_next(struct nm_list_iter *it, const struct nm_payload *p, unsigned int *pos) {
-    if (it->started && nm_list_is_cont(p)) {
-        if (!p->data_size || *pos || p->target_uid != it->have_r || it->have_r > it->h.r_len) return -EPROTO;
+    if (it->started && (p->arg1 & NM_LIST_CONTINUATION)) {
+        if (!p->data_size || *pos || it->have_r > it->h.r_len) return -EPROTO;
         unsigned int left = it->h.r_len - it->have_r;
-        if (p->data_size > left) return -EPROTO;
-        memcpy(it->r + it->have_r, p->buffer, p->data_size);
-        it->have_r += p->data_size;
-        *pos = 0;
+        if (nm_list_is_cont(p)) {
+            if (p->data_size > left || p->target_uid != it->have_r + p->data_size) return -EPROTO;
+        } else {
+            if (p->data_size < left || p->target_uid != 0) return -EPROTO;
+        }
+        unsigned int n = p->data_size < left ? p->data_size : left;
+        memcpy(it->r + it->have_r, p->buffer, n);
+        it->have_r += n;
+        *pos = nm_list_is_cont(p) ? 0 : n;
         if (it->have_r == it->h.r_len) {
             it->have_r = 0;
             it->started = 0;
-            *pos = p->data_size;
             return 1;
         }
         return 0;

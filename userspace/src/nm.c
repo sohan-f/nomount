@@ -274,6 +274,7 @@ int main(int argc, char **argv) {
                             payload->arg1 = ~0U;
                             break;
                         }
+                        if (next == 0 && it.started) break;
                     }
                 }
             } while (payload->arg1 != ~0U);
