@@ -476,7 +476,17 @@ static bool nm_binding_matches_rule(struct inode *inode, const struct nm_rule *r
     return nm_inode_matches_attrs(inode, r_inode);
 }
 
-static int nm_cached_inode_set(struct inode *inode, void *data) { return 0; }
+static int nm_cached_inode_set(struct inode *inode, void *data)
+{
+    struct nm_inode_info *info = data;
+    struct inode *r_inode = info->r_path.dentry ? d_backing_inode(info->r_path.dentry) : NULL;
+
+    /* The stack probe is valid until I_NEW is cleared; test() runs under inode_hash_lock. */
+    inode->i_op = (r_inode && !S_ISDIR(r_inode->i_mode)) ? &nm_file_iops : &nm_dir_iops;
+    WRITE_ONCE(inode->i_private, info);
+    return 0;
+}
+
 static int nm_cached_inode_test(struct inode *inode, void *data)
 {
     struct nm_inode_info *info = data;
@@ -512,7 +522,10 @@ static struct dentry *nm_materialize_rule(struct inode *dir, struct dentry *dent
     if (fresh_kernfs || nm_inode_is_new(inode)) {
         if (!(info = kmalloc(sizeof(*info), GFP_KERNEL))) {
             if (fresh_kernfs) iput(inode);
-            else iget_failed(inode);
+            else {
+                WRITE_ONCE(inode->i_private, NULL);
+                iget_failed(inode);
+            }
             goto out;
         }
         *info = probe;
