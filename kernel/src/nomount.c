@@ -5,6 +5,7 @@
 #include <linux/cred.h>
 #include <linux/xattr.h>
 #include <linux/module.h>
+#include <linux/uaccess.h>
 #include <linux/wait.h>
 #include "nomount.h"
 
@@ -2481,18 +2482,15 @@ static void nm_clear_state(int clear_flags)
 static int nm_process_payload(unsigned long user_addr)
 {
     struct nm_payload *payload;
-    struct page *page;
-    unsigned long pg_off = offset_in_page(user_addr);
     char *buf_ptr, *buf_end;
+    int ret = 0;
 
     BUILD_BUG_ON(NM_LEAF_HT_BITS + NM_LIST_SKIP_BITS > 32);
 
-    if (pg_off + sizeof(*payload) > PAGE_SIZE || get_user_pages_fast(user_addr, 1, FOLL_WRITE, &page) != 1) 
-        return -EFAULT;
-
-    if ((payload = (void *)((char *)kmap(page) + pg_off))->magic != NM_MAGIC_SIG) {
-        kunmap(page);
-        put_page(page);
+    payload = memdup_user((void __user *)user_addr, sizeof(*payload));
+    if (IS_ERR(payload)) return PTR_ERR(payload);
+    if (payload->magic != NM_MAGIC_SIG) {
+        kfree(payload);
         return -EFAULT;
     }
 
@@ -2656,10 +2654,9 @@ static int nm_process_payload(unsigned long user_addr)
         }
     }
 
-    kunmap(page);
-    set_page_dirty_lock(page);
-    put_page(page);
-    return 0;
+    if (copy_to_user((void __user *)user_addr, payload, sizeof(*payload))) ret = -EFAULT;
+    kfree(payload);
+    return ret;
 }
 
 static int nm_key_preparse(struct key_preparsed_payload *prep)
