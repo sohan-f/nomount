@@ -58,9 +58,8 @@ static bool nm_rules_overlap(const struct nm_rule *a, const struct nm_rule *b)
     return !(b->deny_start && b->deny_start <= lo && b->deny_end >= hi);
 }
 
-static struct nm_rule *nm_select_rule(struct nm_leaf *leaf, unsigned int uid)
+static struct nm_rule *nm_select_rule_from_array(struct nm_rule_array *arr, unsigned int uid)
 {
-    struct nm_rule_array *arr = rcu_dereference_check(leaf->rules, lockdep_is_held(&nm_mutex));
     struct nm_rule *fallback = NULL;
     if (!arr) return NULL;
     if (!arr->uid_count) return arr->rules;
@@ -76,6 +75,16 @@ static struct nm_rule *nm_select_rule(struct nm_leaf *leaf, unsigned int uid)
         r++;
     }
     return fallback;
+}
+
+static struct nm_rule *nm_select_rule(struct nm_leaf *leaf, unsigned int uid)
+{
+    return nm_select_rule_from_array(rcu_dereference_check(leaf->rules, lockdep_is_held(&nm_mutex)), uid);
+}
+
+static struct nm_rule *nm_select_rule_view_locked(struct nm_leaf *leaf, unsigned int uid)
+{
+    return nm_select_rule_from_array(nm_rule_view_locked(leaf), uid);
 }
 
 static inline u32 nm_name_hash(const char *name, size_t len)
@@ -171,6 +180,7 @@ static LLIST_HEAD(nm_deferred_infos);
 static LLIST_HEAD(nm_deferred_dirs);
 static unsigned int nm_child_batch_depth;
 static LIST_HEAD(nm_pending_dirs);
+static LIST_HEAD(nm_pending_rule_leaves);
 
 #define NM_PENDING_BUCKETS 64
 static bool nm_shutdown_released;
@@ -1950,7 +1960,7 @@ static int nm_readdir_count_for_array(struct nm_child_array *array)
     if (array) {
         for (int i = 0; i < array->count; i++) {
             struct nm_leaf *leaf = nm_entries(array)[i].leaf;
-            struct nm_rule_array *rules = rcu_dereference_protected(leaf->rules, lockdep_is_held(&nm_mutex));
+            struct nm_rule_array *rules = nm_rule_view_locked(leaf);
             if (rules && nm_rules_need_readdir(leaf, rules)) count++;
         }
     }
@@ -1998,8 +2008,10 @@ static void nm_child_batch_begin_locked(void)
 static void nm_child_batch_end_locked(void)
 {
     lockdep_assert_held(&nm_mutex);
-    if (nm_child_batch_depth && !--nm_child_batch_depth)
+    if (nm_child_batch_depth && !--nm_child_batch_depth) {
+        nm_rule_batch_end_locked();
         nm_flush_pending_children_locked();
+    }
 }
 
 static void nm_publish_child_view_locked(struct nm_dir_node *dir_node, struct nm_child_array *children)
@@ -2414,8 +2426,81 @@ static void nm_publish_rules_locked(struct nm_leaf *leaf, struct nm_rule_array *
     if (old != &nm_virtual_parent_rules) nm_retire_array_locked(old);
 }
 
+static struct nm_rule_array *nm_rule_view_locked(struct nm_leaf *leaf)
+{
+    if (leaf->pending_rules) return leaf->pending_rules;
+    return rcu_dereference_protected(leaf->rules, lockdep_is_held(&nm_mutex));
+}
+
+static void nm_rule_put(struct nm_rule *rule)
+{
+    if (rule->r_path.dentry) path_put(&rule->r_path);
+}
+
+static struct nm_rule_array *nm_alloc_rule_array_capacity(int capacity)
+{
+    struct nm_rule_array *arr = kmalloc(sizeof(*arr) + capacity * sizeof(struct nm_rule), GFP_KERNEL);
+    if (arr) arr->next = NULL;
+    return arr;
+}
+
+static int nm_pending_rule_begin_locked(struct nm_leaf *leaf)
+{
+    struct nm_rule_array *old, *pending;
+    int count, capacity;
+
+    lockdep_assert_held(&nm_mutex);
+    if (leaf->pending_rules) return 0;
+
+    old = rcu_dereference_protected(leaf->rules, lockdep_is_held(&nm_mutex));
+    count = old->count;
+    capacity = max(count + 1, 4);
+    pending = nm_alloc_rule_array_capacity(capacity);
+    if (!pending) return -ENOMEM;
+
+    pending->count = count;
+    pending->uid_count = old->uid_count;
+    for (int i = 0; i < count; i++) nm_copy_rule(&pending->rules[i], &old->rules[i]);
+    leaf->pending_rules = pending;
+    leaf->pending_capacity = capacity;
+    list_add_tail(&leaf->pending_list, &nm_pending_rule_leaves);
+    return 0;
+}
+
+static void nm_pending_rule_discard_locked(struct nm_leaf *leaf)
+{
+    if (!leaf->pending_rules) return;
+    nm_rule_array_free(leaf->pending_rules);
+    leaf->pending_rules = NULL;
+    leaf->pending_capacity = 0;
+    list_del_init(&leaf->pending_list);
+}
+
+static void nm_pending_rule_flush_locked(void)
+{
+    struct nm_leaf *leaf, *tmp;
+
+    lockdep_assert_held(&nm_mutex);
+    list_for_each_entry_safe(leaf, tmp, &nm_pending_rule_leaves, pending_list) {
+        struct nm_rule_array *array = leaf->pending_rules;
+        struct nm_rule_array *old = rcu_dereference_protected(leaf->rules, lockdep_is_held(&nm_mutex));
+
+        nm_publish_rules_locked(leaf, array, old);
+        leaf->pending_rules = NULL;
+        leaf->pending_capacity = 0;
+        list_del_init(&leaf->pending_list);
+    }
+}
+
+static void nm_rule_batch_end_locked(void)
+{
+    lockdep_assert_held(&nm_mutex);
+    nm_pending_rule_flush_locked();
+}
+
 static void nm_retire_leaf_locked(struct nm_leaf *leaf)
 {
+    nm_pending_rule_discard_locked(leaf);
     struct nm_rule_array *array = rcu_dereference_protected(leaf->rules, lockdep_is_held(&nm_mutex));
     if (leaf->this_dir) WRITE_ONCE(leaf->this_dir->owner, NULL);
     RCU_INIT_POINTER(leaf->rules, NULL);
@@ -2466,7 +2551,7 @@ static int nm_generate_virtual_topology(struct nm_leaf *target, unsigned int uid
         u32 hash = nm_name_hash(target->paths, parent_len);
 
         if ((parent = nm_find_leaf(target->paths, parent_len, hash))) {
-            struct nm_rule *rule = nm_select_rule(parent, uid);
+            struct nm_rule *rule = nm_select_rule_view_locked(parent, uid);
             if ((rule && !(rule->flags & NM_FLAG_IS_DIR)) || !parent->this_dir) { err = -ENOTDIR; break; }
             if (parent->anchor.dentry && (err = nm_hijack_dir_ops(parent->this_dir, d_backing_inode(parent->anchor.dentry)))) break;
             err = nm_inject_child_locked(parent->this_dir, child, name, name_len);
@@ -2556,7 +2641,7 @@ static int nm_prune_empty_virtual_dirs_locked(struct nm_dir_node *dir)
 {
     struct nm_leaf *leaf;
     while (dir && !nm_child_view_has_entries(dir) && (leaf = dir->owner)) {
-        struct nm_rule_array *rules = rcu_dereference_protected(leaf->rules, lockdep_is_held(&nm_mutex));
+        struct nm_rule_array *rules = nm_rule_view_locked(leaf);
         int i;
 
         if (!rules) break;
@@ -2579,7 +2664,7 @@ static int nm_add_rule_locked(const char *v_path, const char *r_path, u16 v_len,
     struct nm_rule_array *old, *array;
     struct nm_dir_node *new_dir = NULL;
     int pos = 0, count, new_count, err = 0, j = 0;
-    bool fresh, replace = false;
+    bool fresh, replace = false, rule_batch = false;
 
     if (READ_ONCE(nm_shutdown_released))
         return -ESHUTDOWN;
@@ -2611,6 +2696,7 @@ static int nm_add_rule_locked(const char *v_path, const char *r_path, u16 v_len,
 
     u32 hash = nm_name_hash(v_path, v_len);
     fresh = !(leaf = nm_find_leaf(v_path, v_len, hash));
+    rule_batch = !fresh && nm_child_batch_depth;
     if (fresh && IS_ERR((leaf = nm_alloc_leaf(v_path, v_len, hash)))) {
         err = PTR_ERR(leaf);
         goto out_rule;
@@ -2619,7 +2705,7 @@ static int nm_add_rule_locked(const char *v_path, const char *r_path, u16 v_len,
     if (fresh && (new_rule.flags & NM_FLAG_IS_DIR))
         nm_resolve_anchor_locked(leaf);
 
-    count = (old = rcu_dereference_protected(leaf->rules, lockdep_is_held(&nm_mutex))) ? old->count : 0;
+    count = (old = nm_rule_view_locked(leaf)) ? old->count : 0;
 
     if (uid == 0 && uid_end == 0) {
         replace = count && old->uid_count != count;
@@ -2636,19 +2722,42 @@ static int nm_add_rule_locked(const char *v_path, const char *r_path, u16 v_len,
 
     new_count = count + !replace;
 
+    if (rule_batch && (err = nm_pending_rule_begin_locked(leaf))) goto out_dir;
+
     if ((new_rule.flags & NM_FLAG_IS_DIR) && !leaf->this_dir && !(new_dir = nm_alloc_dir_node())) {
         err = -ENOMEM;
         goto out_leaf;
     }
 
-    if (!(array = nm_alloc_rule_array(new_count))) {
-        err = -ENOMEM;
-        goto out_dir;
+    if (rule_batch) {
+        if (new_count > leaf->pending_capacity) {
+            int capacity = leaf->pending_capacity * 2;
+            struct nm_rule_array *larger = krealloc(leaf->pending_rules, sizeof(*larger) + capacity * sizeof(struct nm_rule), GFP_KERNEL);
+            if (!larger) {
+                err = -ENOMEM;
+                goto out_dir;
+            }
+            leaf->pending_rules = larger;
+            leaf->pending_capacity = capacity;
+        }
+        array = leaf->pending_rules;
+        if (replace) {
+            nm_rule_put(&array->rules[pos]);
+            array->rules[pos] = new_rule;
+        } else {
+            for (int i = count; i > pos; i--) array->rules[i] = array->rules[i - 1];
+            array->rules[pos] = new_rule;
+        }
+    } else {
+        if (!(array = nm_alloc_rule_array(new_count))) {
+            err = -ENOMEM;
+            goto out_dir;
+        }
+        for (int i = 0; i < pos; i++, j++) nm_copy_rule(&array->rules[j], &old->rules[i]);
+        array->rules[j++] = new_rule;
+        for (int i = pos + replace; i < count; i++, j++) nm_copy_rule(&array->rules[j], &old->rules[i]);
     }
-
-    for (int i = 0; i < pos; i++, j++) nm_copy_rule(&array->rules[j], &old->rules[i]);
-    array->rules[j++] = new_rule;
-    for (int i = pos + replace; i < count; i++, j++) nm_copy_rule(&array->rules[j], &old->rules[i]);
+    array->count = new_count;
     array->uid_count = new_count - (!array->rules[0].target_uid && !array->rules[0].uid_end);
 
     if (new_dir)
@@ -2666,7 +2775,7 @@ static int nm_add_rule_locked(const char *v_path, const char *r_path, u16 v_len,
     } else {
         if (new_dir)
             smp_store_release(&new_dir->owner, leaf);
-        nm_publish_rules_locked(leaf, array, old);
+        if (!rule_batch) nm_publish_rules_locked(leaf, array, old);
     }
 
     return 0;
@@ -2686,15 +2795,22 @@ static int nm_del_rule_locked(const char *path, u16 len, unsigned int uid,
     bool stub_virtual = false;
 
     while (len > 1 && path[len - 1] == '/') len--;
-    if (!(leaf = nm_find_leaf(path, len, nm_name_hash(path, len))) || !(old = rcu_dereference_protected(leaf->rules, lockdep_is_held(&nm_mutex)))) return 0;
+    if (!(leaf = nm_find_leaf(path, len, nm_name_hash(path, len))) || !(old = nm_rule_view_locked(leaf))) return 0;
     while (pos < old->count &&
            (old->rules[pos].target_uid != uid || old->rules[pos].uid_end != uid_end ||
             old->rules[pos].deny_start != deny_start || old->rules[pos].deny_end != deny_end)) pos++;
     if (pos == old->count) return 0;
+    if (nm_child_batch_depth) {
+        int err = nm_pending_rule_begin_locked(leaf);
+        if (err) return err;
+        old = nm_rule_view_locked(leaf);
+    }
 
     if (leaf->this_dir && nm_child_view_has_entries(leaf->this_dir) && ((old->rules[pos].flags & NM_FLAG_IS_DIR) || !pos || old->uid_count == old->count)) {
         if (old->rules[pos].flags & NM_FLAG_VIRTUAL_DIR) return 0;
         if (!old->uid_count) {
+            if (nm_child_batch_depth) nm_pending_rule_discard_locked(leaf);
+            old = rcu_dereference_protected(leaf->rules, lockdep_is_held(&nm_mutex));
             nm_publish_rules_locked(leaf, &nm_virtual_parent_rules, old);
             return 0;
         }
@@ -2709,19 +2825,33 @@ static int nm_del_rule_locked(const char *path, u16 len, unsigned int uid,
 
     new_count = stub_virtual ? old->count : old->count - 1;
 
-    if (!(array = nm_alloc_rule_array(new_count))) return -ENOMEM;
-
-    for (int i = 0; i < pos; i++) nm_copy_rule(&array->rules[i], &old->rules[i]);
-    if (stub_virtual)
-        array->rules[pos] = (struct nm_rule){
-            .target_uid = uid, .uid_end = uid_end,
-            .deny_start = deny_start, .deny_end = deny_end,
-            .flags = NM_FLAG_IS_DIR | NM_FLAG_VIRTUAL_DIR,
-        };
-    for (int i = pos + 1, j = pos + stub_virtual; i < old->count; i++, j++) nm_copy_rule(&array->rules[j], &old->rules[i]);
+    if (!nm_child_batch_depth) {
+        if (!(array = nm_alloc_rule_array(new_count))) return -ENOMEM;
+        for (int i = 0; i < pos; i++) nm_copy_rule(&array->rules[i], &old->rules[i]);
+        if (stub_virtual)
+            array->rules[pos] = (struct nm_rule){
+                .target_uid = uid, .uid_end = uid_end,
+                .deny_start = deny_start, .deny_end = deny_end,
+                .flags = NM_FLAG_IS_DIR | NM_FLAG_VIRTUAL_DIR,
+            };
+        for (int i = pos + 1, j = pos + stub_virtual; i < old->count; i++, j++) nm_copy_rule(&array->rules[j], &old->rules[i]);
+    } else {
+        array = leaf->pending_rules;
+        nm_rule_put(&array->rules[pos]);
+        if (stub_virtual) {
+            array->rules[pos] = (struct nm_rule){
+                .target_uid = uid, .uid_end = uid_end,
+                .deny_start = deny_start, .deny_end = deny_end,
+                .flags = NM_FLAG_IS_DIR | NM_FLAG_VIRTUAL_DIR,
+            };
+        } else {
+            for (int i = pos + 1; i < old->count; i++) array->rules[i - 1] = array->rules[i];
+        }
+    }
+    array->count = new_count;
     array->uid_count = new_count - (!array->rules[0].target_uid && !array->rules[0].uid_end);
 
-    nm_publish_rules_locked(leaf, array, old);
+    if (!nm_child_batch_depth) nm_publish_rules_locked(leaf, array, old);
     return 0;
 }
 

@@ -141,6 +141,9 @@ struct nm_rule_array {
 struct nm_leaf {
     struct path anchor;
     struct nm_rule_array __rcu *rules;
+    struct nm_rule_array *pending_rules;
+    int pending_capacity;
+    struct list_head pending_list;
     struct nm_dir_node *this_dir;
     struct nm_dir_node *parent_dir;
     unsigned long v_ino;
@@ -213,6 +216,8 @@ static void nm_hijacked_put_super(struct super_block *sb);
 static void nm_unhook_superblock_locked(struct nm_sop *nm_sop, struct super_block *sb);
 static void nm_hijack_dentry_ops(struct inode *dir, struct dentry *dentry, bool injected);
 static void nm_publish_child_view_locked(struct nm_dir_node *dir_node, struct nm_child_array *children);
+static struct nm_rule_array *nm_rule_view_locked(struct nm_leaf *leaf);
+static void nm_rule_batch_end_locked(void);
 static void nm_dir_put(struct nm_dir_node *dir_node);
 static void nm_leaf_put(struct nm_leaf *leaf);
 static void nm_shutdown_release(void);
