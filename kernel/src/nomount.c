@@ -92,13 +92,13 @@ static struct nm_leaf *nm_find_leaf_in_dir(struct nm_dir_node *dir_node, const c
     if (!dir_node || !(children = rcu_dereference_check(dir_node->children, lockdep_is_held(&nm_mutex))))
         return NULL;
     entries = nm_entries(children);
-    hash = nm_name_hash(name, len);
     if (!children->bucket_slots) {
         for (i = 0; i < children->count; i++)
-            if (entries[i].hash == hash && nm_child_matches(entries[i].leaf, name, len))
+            if (nm_child_matches(entries[i].leaf, name, len))
                 return entries[i].leaf;
         return NULL;
     }
+    hash = nm_name_hash(name, len);
     bucket = nm_child_bucket(children, hash);
     for (i = children->starts[bucket]; i < children->starts[bucket + 1]; i++)
         if (entries[i].hash == hash && nm_child_matches(entries[i].leaf, name, len))
