@@ -169,6 +169,10 @@ static void nm_reclaim(struct work_struct *work);
 static DECLARE_WORK(nm_reclaim_work, nm_reclaim);
 static LLIST_HEAD(nm_deferred_infos);
 static LLIST_HEAD(nm_deferred_dirs);
+static unsigned int nm_child_batch_depth;
+static LIST_HEAD(nm_pending_dirs);
+
+#define NM_PENDING_BUCKETS 64
 static bool nm_shutdown_released;
 static bool nm_module_pinned;
 static atomic_t nm_active_operations = ATOMIC_INIT(0);
@@ -1796,6 +1800,185 @@ static bool nm_rules_need_readdir(struct nm_leaf *leaf, struct nm_rule_array *ru
     return false;
 }
 
+static int nm_pending_live_count(struct nm_child_array *pending)
+{
+    int count = 0;
+
+    for (int i = 0; i < pending->count; i++)
+        if (nm_entries(pending)[i].leaf) count++;
+    return count;
+}
+
+static void nm_rebuild_pending_children(struct nm_child_array *array, struct nm_child_array *pending)
+{
+    struct nm_child *entries = nm_entries(array);
+    int count = nm_pending_live_count(pending);
+    int at = 0;
+    u16 b;
+
+    array->count = count;
+    if (!array->bucket_slots) {
+        for (int i = 0; i < pending->count; i++)
+            if (nm_entries(pending)[i].leaf) entries[at++] = nm_entries(pending)[i];
+        return;
+    }
+
+    memset(array->starts, 0, array->bucket_slots * sizeof(u32));
+    for (int i = 0; i < pending->count; i++) {
+        struct nm_child *child = &nm_entries(pending)[i];
+        if (child->leaf) array->starts[nm_child_bucket(array, child->hash)]++;
+    }
+    for (b = 1; b < array->bucket_slots; b++)
+        array->starts[b] += array->starts[b - 1];
+    for (int i = pending->count - 1; i >= 0; i--) {
+        struct nm_child *child = &nm_entries(pending)[i];
+        if (child->leaf) entries[--array->starts[nm_child_bucket(array, child->hash)]] = *child;
+    }
+}
+
+static void nm_compact_pending_children(struct nm_child_array *pending)
+{
+    struct nm_child *entries = nm_entries(pending);
+    int at = 0;
+
+    for (int i = 0; i < pending->count; i++)
+        if (entries[i].leaf) entries[at++] = entries[i];
+    pending->count = at;
+}
+
+static struct nm_child_array *nm_alloc_pending_children(int capacity)
+{
+    size_t sz = ALIGN(sizeof(struct nm_child_array), 8) + capacity * sizeof(struct nm_child);
+    struct nm_child_array *array = kmalloc(sz, GFP_KERNEL);
+
+    if (array) array->bucket_slots = 0;
+    return array;
+}
+
+static struct nm_child_array *nm_child_view_locked(struct nm_dir_node *dir_node)
+{
+    if (dir_node->pending) return dir_node->pending;
+    return rcu_dereference_protected(dir_node->children, lockdep_is_held(&nm_mutex));
+}
+
+static bool nm_child_view_has_entries(struct nm_dir_node *dir_node)
+{
+    if (dir_node->pending) return dir_node->pending_live != 0;
+    return rcu_access_pointer(dir_node->children) != NULL;
+}
+
+static struct nm_leaf *nm_find_leaf_in_view_locked(struct nm_dir_node *dir_node, const char *name, size_t len)
+{
+    struct nm_child_array *array = nm_child_view_locked(dir_node);
+    struct nm_child *entries;
+    u32 hash;
+    s32 index;
+
+    if (!dir_node->pending) return nm_find_leaf_in_dir(dir_node, name, len);
+    hash = nm_name_hash(name, len);
+    entries = nm_entries(array);
+    for (index = dir_node->pending_buckets[hash & (NM_PENDING_BUCKETS - 1)]; index >= 0; index = entries[index].next)
+        if (entries[index].leaf && entries[index].hash == hash && nm_child_matches(entries[index].leaf, name, len))
+            return entries[index].leaf;
+    return NULL;
+}
+
+static int nm_pending_begin_locked(struct nm_dir_node *dir_node)
+{
+    struct nm_child_array *old, *pending;
+    int count, capacity;
+
+    lockdep_assert_held(&nm_mutex);
+    if (dir_node->pending) return 0;
+
+    old = rcu_dereference_protected(dir_node->children, lockdep_is_held(&nm_mutex));
+    count = old ? old->count : 0;
+    capacity = max(count + 1, 4);
+    pending = nm_alloc_pending_children(capacity);
+    if (!pending) return -ENOMEM;
+
+    pending->count = count;
+    if (count) memcpy(nm_entries(pending), nm_entries(old), count * sizeof(struct nm_child));
+    dir_node->pending_buckets = kcalloc(NM_PENDING_BUCKETS, sizeof(s32), GFP_KERNEL);
+    if (!dir_node->pending_buckets) {
+        kfree(pending);
+        return -ENOMEM;
+    }
+    memset(dir_node->pending_buckets, 0xFF, NM_PENDING_BUCKETS * sizeof(s32));
+    for (int i = 0; i < count; i++) {
+        struct nm_child *child = &nm_entries(pending)[i];
+        u32 bucket = child->hash & (NM_PENDING_BUCKETS - 1);
+        child->leaf->pending_index = i;
+        child->next = dir_node->pending_buckets[bucket];
+        dir_node->pending_buckets[bucket] = i;
+    }
+    dir_node->pending = pending;
+    dir_node->pending_capacity = capacity;
+    dir_node->pending_live = count;
+    atomic_inc(&dir_node->refs);
+    list_add_tail(&dir_node->pending_list, &nm_pending_dirs);
+    return 0;
+}
+
+static int nm_readdir_count_for_array(struct nm_child_array *array)
+{
+    int count = 0;
+
+    if (array) {
+        for (int i = 0; i < array->count; i++) {
+            struct nm_leaf *leaf = nm_entries(array)[i].leaf;
+            struct nm_rule_array *rules = rcu_dereference_protected(leaf->rules, lockdep_is_held(&nm_mutex));
+            if (rules && nm_rules_need_readdir(leaf, rules)) count++;
+        }
+    }
+    return count;
+}
+
+static void nm_flush_pending_children_locked(void)
+{
+    struct nm_dir_node *dir_node, *tmp;
+
+    lockdep_assert_held(&nm_mutex);
+    list_for_each_entry_safe(dir_node, tmp, &nm_pending_dirs, pending_list) {
+        struct nm_child_array *pending = dir_node->pending;
+        struct nm_child_array *final = NULL;
+
+        if (dir_node->pending_live) {
+            final = nm_alloc_child_array(dir_node->pending_live);
+            if (final) nm_rebuild_pending_children(final, pending);
+            else {
+                nm_compact_pending_children(pending);
+                final = pending;
+            }
+        }
+        int readdir_count = nm_readdir_count_for_array(final);
+        if (readdir_count) WRITE_ONCE(dir_node->readdir_count, readdir_count);
+        nm_publish_child_view_locked(dir_node, final);
+        if (!readdir_count) WRITE_ONCE(dir_node->readdir_count, 0);
+        if (final != pending) kfree(pending);
+        dir_node->pending = NULL;
+        dir_node->pending_capacity = 0;
+        dir_node->pending_live = 0;
+        kfree(dir_node->pending_buckets);
+        dir_node->pending_buckets = NULL;
+        list_del_init(&dir_node->pending_list);
+        nm_dir_put(dir_node);
+    }
+}
+
+static void nm_child_batch_begin_locked(void)
+{
+    lockdep_assert_held(&nm_mutex);
+    nm_child_batch_depth++;
+}
+
+static void nm_child_batch_end_locked(void)
+{
+    lockdep_assert_held(&nm_mutex);
+    if (nm_child_batch_depth && !--nm_child_batch_depth)
+        nm_flush_pending_children_locked();
+}
+
 static void nm_publish_child_view_locked(struct nm_dir_node *dir_node, struct nm_child_array *children)
 {
     struct nm_child_array *old = rcu_dereference_protected(dir_node->children, lockdep_is_held(&nm_mutex));
@@ -1811,7 +1994,7 @@ static void nm_publish_child_view_locked(struct nm_dir_node *dir_node, struct nm
     if (old) kfree_rcu(old, rcu);
 }
 
-static int nm_inject_child_locked(struct nm_dir_node *dir_node, struct nm_leaf *leaf, const char *name, size_t name_len)
+static int nm_inject_child_immediate_locked(struct nm_dir_node *dir_node, struct nm_leaf *leaf, const char *name, size_t name_len)
 {
     struct nm_child_array *array, *old = rcu_dereference_protected(dir_node->children, lockdep_is_held(&nm_mutex));
     int count = old ? old->count : 0;
@@ -1841,7 +2024,7 @@ static int nm_inject_child_locked(struct nm_dir_node *dir_node, struct nm_leaf *
     return 0;
 }
 
-static struct nm_dir_node *nm_delete_child_locked(struct nm_leaf *leaf, bool clear)
+static struct nm_dir_node *nm_delete_child_immediate_locked(struct nm_leaf *leaf, bool clear)
 {
     struct nm_dir_node *dir_node = leaf->parent_dir;
     struct nm_child_array *old, *array = NULL;
@@ -1873,6 +2056,65 @@ static struct nm_dir_node *nm_delete_child_locked(struct nm_leaf *leaf, bool cle
     nm_publish_child_view_locked(dir_node, array);
     if (array && nm_rules_need_readdir(leaf, rcu_dereference_protected(leaf->rules, lockdep_is_held(&nm_mutex))))
         WRITE_ONCE(dir_node->readdir_count, dir_node->readdir_count - 1);
+    return dir_node;
+}
+
+static int nm_inject_child_locked(struct nm_dir_node *dir_node, struct nm_leaf *leaf, const char *name, size_t name_len)
+{
+    struct nm_child_array *pending;
+    struct nm_child child;
+    int err;
+
+    if (!nm_child_batch_depth) return nm_inject_child_immediate_locked(dir_node, leaf, name, name_len);
+    if (unlikely(!name_len || name_len > NAME_MAX)) return -EINVAL;
+
+    err = nm_pending_begin_locked(dir_node);
+    if (err) return err;
+    if (nm_find_leaf_in_view_locked(dir_node, name, name_len)) return -EEXIST;
+
+    pending = dir_node->pending;
+    if (pending->count == dir_node->pending_capacity) {
+        int capacity = dir_node->pending_capacity * 2;
+        struct nm_child_array *larger = krealloc(pending, ALIGN(sizeof(*pending), 8) + capacity * sizeof(child), GFP_KERNEL);
+        if (!larger) return -ENOMEM;
+        dir_node->pending = larger;
+        dir_node->pending_capacity = capacity;
+        pending = larger;
+    }
+
+    leaf->child_len = name_len;
+    child = (struct nm_child){ .leaf = leaf, .hash = nm_name_hash(name, name_len) };
+    leaf->child_hash = (u16)child.hash;
+    leaf->pending_index = pending->count;
+    nm_entries(pending)[pending->count] = child;
+    nm_entries(pending)[pending->count].next = dir_node->pending_buckets[child.hash & (NM_PENDING_BUCKETS - 1)];
+    dir_node->pending_buckets[child.hash & (NM_PENDING_BUCKETS - 1)] = pending->count;
+    pending->count++;
+    dir_node->pending_live++;
+    leaf->parent_dir = dir_node;
+    atomic_inc(&dir_node->refs);
+    return 0;
+}
+
+static struct nm_dir_node *nm_delete_child_locked(struct nm_leaf *leaf, bool clear)
+{
+    struct nm_dir_node *dir_node;
+    struct nm_child_array *pending;
+    struct nm_child *entries;
+    int err;
+
+    if (clear || !nm_child_batch_depth) return nm_delete_child_immediate_locked(leaf, clear);
+    dir_node = leaf->parent_dir;
+    if (!dir_node) return NULL;
+
+    err = nm_pending_begin_locked(dir_node);
+    if (err) return ERR_PTR(err);
+    pending = dir_node->pending;
+    entries = nm_entries(pending);
+    if (leaf->pending_index >= 0 && leaf->pending_index < pending->count && entries[leaf->pending_index].leaf == leaf) {
+        entries[leaf->pending_index].leaf = NULL;
+        dir_node->pending_live--;
+    }
     return dir_node;
 }
 
@@ -2290,7 +2532,7 @@ static struct nm_dir_node *nm_detach_leaf_locked(struct nm_leaf *leaf)
 static int nm_prune_empty_virtual_dirs_locked(struct nm_dir_node *dir)
 {
     struct nm_leaf *leaf;
-    while (dir && !rcu_access_pointer(dir->children) && (leaf = dir->owner)) {
+    while (dir && !nm_child_view_has_entries(dir) && (leaf = dir->owner)) {
         struct nm_rule_array *rules = rcu_dereference_protected(leaf->rules, lockdep_is_held(&nm_mutex));
         int i;
 
@@ -2427,7 +2669,7 @@ static int nm_del_rule_locked(const char *path, u16 len, unsigned int uid,
             old->rules[pos].deny_start != deny_start || old->rules[pos].deny_end != deny_end)) pos++;
     if (pos == old->count) return 0;
 
-    if (leaf->this_dir && rcu_access_pointer(leaf->this_dir->children) && ((old->rules[pos].flags & NM_FLAG_IS_DIR) || !pos || old->uid_count == old->count)) {
+    if (leaf->this_dir && nm_child_view_has_entries(leaf->this_dir) && ((old->rules[pos].flags & NM_FLAG_IS_DIR) || !pos || old->uid_count == old->count)) {
         if (old->rules[pos].flags & NM_FLAG_VIRTUAL_DIR) return 0;
         if (!old->uid_count) {
             nm_publish_rules_locked(leaf, &nm_virtual_parent_rules, old);
@@ -2519,6 +2761,7 @@ static int nm_process_payload(unsigned long user_addr)
             buf_ptr = payload->buffer + offset;
             buf_end = payload->buffer + data_size;
             mutex_lock(&nm_mutex);
+            nm_child_batch_begin_locked();
             while (buf_ptr < buf_end) {
                 struct nm_rule_hdr h;
                 int err;
@@ -2537,6 +2780,7 @@ static int nm_process_payload(unsigned long user_addr)
                 if (!payload->status) payload->status = err;
                 buf_ptr += (size_t)(h.v_len + h.r_len);
             }
+            nm_child_batch_end_locked();
             mutex_unlock(&nm_mutex);
             payload->arg1 = buf_ptr - payload->buffer;
             break;
@@ -2548,6 +2792,7 @@ static int nm_process_payload(unsigned long user_addr)
             buf_ptr = payload->buffer + offset;
             buf_end = payload->buffer + data_size;
             mutex_lock(&nm_mutex);
+            nm_child_batch_begin_locked();
             while (buf_ptr < buf_end) {
                 struct nm_del_hdr h;
                 int err;
@@ -2559,6 +2804,7 @@ static int nm_process_payload(unsigned long user_addr)
                 if (!payload->status) payload->status = err;
                 buf_ptr += h.v_len;
             }
+            nm_child_batch_end_locked();
             mutex_unlock(&nm_mutex);
             payload->arg1 = buf_ptr - payload->buffer;
             break;

@@ -98,6 +98,7 @@ struct nm_inode_info {
 struct nm_child {
     struct nm_leaf *leaf;
     u32 hash;
+    s32 next;
 };
 
 struct nm_child_array {
@@ -110,6 +111,11 @@ struct nm_child_array {
 struct nm_dir_node {
     struct llist_node deferred_node;
     struct nm_child_array __rcu *children;
+    struct nm_child_array *pending;
+    s32 *pending_buckets;
+    int pending_capacity;
+    int pending_live;
+    struct list_head pending_list;
     int readdir_count;
     atomic_t refs;
     struct dentry *pinned_dentry;
@@ -143,6 +149,7 @@ struct nm_leaf {
     u16 child_len;
     bool native_file;
     u16 child_hash;
+    int pending_index;
     atomic_t refs;
     union { struct hlist_node ht_node; struct nm_leaf *next; struct rcu_head rcu; };
     char paths[];
@@ -205,6 +212,7 @@ static int nm_hijacked_iterate_dir(struct file *file, struct dir_context *ctx);
 static void nm_hijacked_put_super(struct super_block *sb);
 static void nm_unhook_superblock_locked(struct nm_sop *nm_sop, struct super_block *sb);
 static void nm_hijack_dentry_ops(struct inode *dir, struct dentry *dentry, bool injected);
+static void nm_publish_child_view_locked(struct nm_dir_node *dir_node, struct nm_child_array *children);
 static void nm_dir_put(struct nm_dir_node *dir_node);
 static void nm_leaf_put(struct nm_leaf *leaf);
 static void nm_shutdown_release(void);
