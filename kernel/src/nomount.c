@@ -351,6 +351,18 @@ static inline unsigned char nm_mode_to_dtype(umode_t mode)
 	}
 }
 
+#define NM_READDIR_BATCH 4
+
+struct nm_readdir_entry {
+	char name[NAME_MAX + 1];
+	unsigned long v_ino;
+	u32 frag;
+	u32 next_frag;
+	int name_len;
+	unsigned char d_type;
+	bool emit;
+};
+
 static inline void nm_emit_virtual_children(struct dir_context *ctx, struct nm_dir_node *dir_node, uid_t fsuid, bool native_view)
 {
 	if (!dir_node) return;
@@ -371,39 +383,50 @@ static inline void nm_emit_virtual_children(struct dir_context *ctx, struct nm_d
 		}
 	}
 
-	for (u32 id = index; ; id++) {
-		char name_buf[NAME_MAX + 1];
-		int name_len = 0;
-		unsigned long v_ino = 0;
-		unsigned char d_type = 0;
-		bool do_emit = false, has_more = false;
-		u32 cur_frag = 0, next_frag = 0;
+	for (u32 id = index; ; ) {
+		struct nm_readdir_entry entries[NM_READDIR_BATCH];
+		int count = 0;
+		bool has_more = false;
 
 		rcu_read_lock();
 		struct nm_child_array *array = rcu_dereference(dir_node->children);
-		if (array && id < (u32)array->count) {
-			struct nm_leaf *leaf = nm_entries(array)[id].leaf;
-			struct nm_rule *rule = nm_select_rule(leaf, fsuid);
-			cur_frag = nm_child_frag(nm_entries(array)[id].hash);
-			has_more = true;
-			if (rule && !(rule->flags & NM_FLAG_WHITEOUT) && (!native_view || nm_rule_needs_readdir(leaf, rule))) {
-				name_len = leaf->child_len;
-				if (likely(name_len <= NAME_MAX)) {
-					struct inode *r_inode = rule->r_path.dentry ? d_backing_inode(rule->r_path.dentry) : NULL;
-					memcpy(name_buf, nm_get_child_name(leaf), name_len);
-					v_ino = leaf->v_ino;
-					d_type = r_inode ? nm_mode_to_dtype(r_inode->i_mode) : DT_DIR;
-					do_emit = true;
+		if (array) {
+			while (count < NM_READDIR_BATCH && id + count < (u32)array->count) {
+				u32 slot = id + count;
+				struct nm_readdir_entry *out = &entries[count];
+				struct nm_leaf *leaf = nm_entries(array)[slot].leaf;
+				struct nm_rule *rule = nm_select_rule(leaf, fsuid);
+
+				out->emit = false;
+				out->frag = nm_child_frag(nm_entries(array)[slot].hash);
+				out->next_frag = slot + 1 < (u32)array->count ? nm_child_frag(nm_entries(array)[slot + 1].hash) : 0;
+				if (rule && !(rule->flags & NM_FLAG_WHITEOUT) && (!native_view || nm_rule_needs_readdir(leaf, rule))) {
+					out->name_len = leaf->child_len;
+					if (likely(out->name_len <= NAME_MAX)) {
+						struct inode *r_inode = rule->r_path.dentry ? d_backing_inode(rule->r_path.dentry) : NULL;
+						memcpy(out->name, nm_get_child_name(leaf), out->name_len);
+						out->v_ino = leaf->v_ino;
+						out->d_type = r_inode ? nm_mode_to_dtype(r_inode->i_mode) : DT_DIR;
+						out->emit = true;
+					}
 				}
+				count++;
 			}
-			if (id + 1 < (u32)array->count) next_frag = nm_child_frag(nm_entries(array)[id + 1].hash);
+			has_more = id + count < (u32)array->count;
 		}
 		rcu_read_unlock();
-		if (!has_more) break;
+		if (!count) break;
 
-		ctx->pos = nm_pack_pos(id, cur_frag);
-		if (do_emit && !dir_emit(ctx, name_buf, name_len, v_ino, d_type)) break;
-		ctx->pos = nm_pack_pos(id + 1, next_frag);
+		for (int i = 0; i < count; i++) {
+			struct nm_readdir_entry *entry = &entries[i];
+			u32 slot = id + i;
+
+			ctx->pos = nm_pack_pos(slot, entry->frag);
+			if (entry->emit && !dir_emit(ctx, entry->name, entry->name_len, entry->v_ino, entry->d_type)) return;
+			ctx->pos = nm_pack_pos(slot + 1, entry->next_frag);
+		}
+		if (!has_more) break;
+		id += count;
 	}
 }
 
