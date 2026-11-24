@@ -9,8 +9,8 @@
 
 /*** Helpers ***/
 
-static bool nm_block_isolated_uids = false;
-static __always_inline bool nm_is_uid_blocked(uid_t target_uid)
+/* The caller already holds rcu_read_lock(); nm_is_uid_blocked() takes its own. */
+static __always_inline bool nm_is_uid_blocked_rcu(uid_t target_uid)
 {
     struct nm_uid_array *arr;
 
@@ -19,10 +19,6 @@ static __always_inline bool nm_is_uid_blocked(uid_t target_uid)
         if (app_id >= 90000U && app_id <= 99999U) return true;
     }
 
-    if (likely(!rcu_access_pointer(nm_uids)))
-        return false;
-
-    rcu_guard();
     if ((arr = rcu_dereference(nm_uids)) && nm_uid_bloom_test(arr, target_uid)) {
         for (int i = 0; i < arr->count; i++) {
             if (arr->uids[i] == target_uid)
@@ -30,6 +26,14 @@ static __always_inline bool nm_is_uid_blocked(uid_t target_uid)
         }
     }
     return false;
+}
+
+static bool nm_is_uid_blocked(uid_t target_uid)
+{
+    if (!static_branch_unlikely(&nm_have_uid_filter))
+        return false;
+    rcu_guard();
+    return nm_is_uid_blocked_rcu(target_uid);
 }
 
 static __always_inline bool nm_child_matches(struct nm_leaf *leaf, const char *name, size_t len)
@@ -478,7 +482,7 @@ static struct dentry *nm_hijacked_lookup(struct inode *dir, struct dentry *dentr
             uid_t fsuid = current_fsuid().val;
             struct nm_rule *rule;
 
-            if (likely(!nm_is_uid_blocked(fsuid))) {
+            if (likely(!nm_is_uid_blocked_rcu(fsuid))) {
                 if (unlikely(flags & LOOKUP_RENAME_TARGET) && (rule = nm_select_rule(leaf, fsuid)) &&
                     !(rule->flags & NM_FLAG_WHITEOUT)) {
                     rcu_read_unlock();
@@ -1146,7 +1150,7 @@ static int nm_d_revalidate_common(struct inode *parent_inode, const struct qstr 
         else
             leaf = NULL;
     }
-    if (leaf && !(uid_blocked = nm_is_uid_blocked((fsuid = current_fsuid().val))) && (rule = nm_select_rule(leaf, fsuid))) {
+    if (leaf && !(uid_blocked = nm_is_uid_blocked_rcu((fsuid = current_fsuid().val))) && (rule = nm_select_rule(leaf, fsuid))) {
         has_rule = true;
         if (rule->flags & NM_FLAG_WHITEOUT)
             whiteout = true;
@@ -2195,6 +2199,7 @@ static void nm_clear_state(int clear_flags)
     if (clear_flags & NM_CLEAR_UIDS) {
         struct nm_uid_array *old = rcu_dereference_protected(nm_uids, lockdep_is_held(&nm_mutex));
         RCU_INIT_POINTER(nm_uids, NULL);
+        nm_uid_filter_update();
         if (old) kfree_rcu(old, rcu);
     }
     if (clear_flags & NM_CLEAR_RULES) {
@@ -2305,7 +2310,10 @@ static int nm_process_payload(unsigned long user_addr)
             break;
 
         case NM_CMD_BLOCK_ISOLATED_UIDS:
+            mutex_lock(&nm_mutex);
             WRITE_ONCE(nm_block_isolated_uids, payload->arg1 != 0);
+            nm_uid_filter_update();
+            mutex_unlock(&nm_mutex);
             break;
 
         case NM_CMD_GET_ISOLATED_STATE:

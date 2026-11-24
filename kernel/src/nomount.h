@@ -16,6 +16,7 @@
 #include <linux/highmem.h>
 #include <linux/version.h>
 #include <linux/compat.h>
+#include <linux/jump_label.h>
 
 #define NOMOUNT_BASE_VERSION "23"
 #ifdef NOMOUNT_COMMIT_COUNT
@@ -236,6 +237,20 @@ static inline u32 nm_unpack_pos(loff_t pos) {
 }
 
 /* --- UIDs Array RCU Management --- */
+static bool nm_block_isolated_uids;
+static DEFINE_STATIC_KEY_FALSE(nm_have_uid_filter);
+
+/* nm_mutex held: arm before a filter becomes visible, disarm after it is gone. */
+static inline void nm_uid_filter_update(void)
+{
+    struct nm_uid_array *arr = rcu_dereference_protected(nm_uids, lockdep_is_held(&nm_mutex));
+
+    if ((arr && arr->count) || READ_ONCE(nm_block_isolated_uids))
+        static_branch_enable(&nm_have_uid_filter);
+    else
+        static_branch_disable(&nm_have_uid_filter);
+}
+
 static __always_inline void nm_uid_bloom_set(struct nm_uid_array *arr, uid_t uid)
 {
     arr->bloom_mask[(uid >> 6) & (NM_UID_BLOOM_WORDS - 1)] |= 1ULL << (uid & 63);
@@ -267,6 +282,7 @@ static inline int nm_uid_add(uid_t target)
     new_arr->uids[count] = target;
     nm_uid_bloom_set(new_arr, target);
     rcu_assign_pointer(nm_uids, new_arr);
+    nm_uid_filter_update();
     if (old) kfree_rcu(old, rcu);
     return 0;
 }
@@ -291,6 +307,7 @@ static inline int nm_uid_del(uid_t target)
     }
 
     rcu_assign_pointer(nm_uids, new_arr);
+    nm_uid_filter_update();
     kfree_rcu(old, rcu);
     return 0;
 }
