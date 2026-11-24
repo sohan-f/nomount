@@ -11,6 +11,7 @@
 /*** Helpers ***/
 
 static u32 nm_rule_gen;
+static struct kmem_cache *nm_inode_cache;
 
 /* The caller already holds rcu_read_lock(); nm_is_uid_blocked() takes its own. */
 static __always_inline bool nm_is_uid_blocked_rcu(uid_t target_uid)
@@ -206,6 +207,11 @@ static void nm_dir_put(struct nm_dir_node *dir_node)
         call_rcu(&dir_node->rcu, nm_dir_rcu_free);
 }
 
+static void nm_inode_info_rcu_free(struct rcu_head *head)
+{
+    kmem_cache_free(nm_inode_cache, container_of(head, struct nm_inode_info, rcu));
+}
+
 static inline void nm_destroy_virtual_inode(struct inode *inode)
 {
     struct nm_inode_info *info = READ_ONCE(inode->i_private);
@@ -216,7 +222,7 @@ static inline void nm_destroy_virtual_inode(struct inode *inode)
     if (inode->i_op == &nm_file_iops) nm_leaf_put(info->leaf);
     else nm_dir_put(info->dir_node);
     if (info->r_path.dentry) path_put(&info->r_path);
-    kfree_rcu(info, rcu);
+    call_rcu(&info->rcu, nm_inode_info_rcu_free);
 }
 
 static inline void nm_destroy_hijacked_inode(struct inode *inode)
@@ -478,7 +484,7 @@ static struct dentry *nm_materialize_rule(struct inode *dir, struct dentry *dent
     if (!inode) goto out;
 
     if (nm_inode_is_new(inode)) {
-        if (!(info = kmalloc(sizeof(*info), GFP_KERNEL))) { iget_failed(inode); goto out; }
+        if (!(info = kmem_cache_alloc(nm_inode_cache, GFP_KERNEL))) { iget_failed(inode); goto out; }
         *info = probe;
         nm_init_prealloc_inode(inode, info, rule_info->v_ino);
         unlock_new_inode(inode);
@@ -2513,12 +2519,19 @@ static struct key_type nm_key_type = {
 
 static int __init nomount_init(void)
 {
-    int ret = register_key_type(&nm_key_type);
-    if (ret)
+    int ret;
+
+    nm_inode_cache = kmem_cache_create("nomount_inode", sizeof(struct nm_inode_info), 0, 0, NULL);
+    if (!nm_inode_cache) return -ENOMEM;
+
+    ret = register_key_type(&nm_key_type);
+    if (ret) {
         nm_err("Failed to register key type (err: %d)\n", ret);
-    else
-        nm_info("Loaded successfully\n");
-    return ret;
+        kmem_cache_destroy(nm_inode_cache);
+        return ret;
+    }
+    nm_info("Loaded successfully\n");
+    return 0;
 }
 
 static void __exit nomount_exit(void)
@@ -2527,6 +2540,7 @@ static void __exit nomount_exit(void)
     nm_clear_state(NM_CLEAR_UIDS | NM_CLEAR_RULES | NM_CLEAR_EXIT);
     flush_work(&nm_reclaim_work);
     rcu_barrier();
+    kmem_cache_destroy(nm_inode_cache);
     nm_info("Unloaded successfully\n");
 }
 
