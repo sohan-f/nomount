@@ -190,7 +190,9 @@ static inline u16 nm_child_slots_for(int count)
     if (count <= 64)  return 33;
     if (count <= 256) return 129;
     if (count <= 1024) return 257;
-    return 513;
+    if (count <= 4096) return 1025;
+    if (count <= 16384) return 2049;
+    return 4097;
 }
 
 static inline u32 nm_child_bucket(struct nm_child_array *arr, u32 hash)
