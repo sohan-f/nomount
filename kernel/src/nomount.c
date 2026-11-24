@@ -2159,6 +2159,14 @@ static void nm_retire_leaf_locked(struct nm_leaf *leaf)
     else schedule_work(&nm_reclaim_work);
 }
 
+static void nm_unlink_or_keep_leaf_locked(struct nm_leaf *leaf)
+{
+    if (IS_ERR(nm_delete_child_locked(leaf, false)))
+        hash_add(nm_leaves_ht, &leaf->ht_node, leaf->v_hash);
+    else
+        nm_retire_leaf_locked(leaf);
+}
+
 static void nm_prepare_native_file(struct nm_leaf *leaf, struct nm_dir_node *dir_node, const struct path *parent, const char *name)
 {
     switch (parent->dentry->d_sb->s_magic) {
@@ -2269,10 +2277,7 @@ static int nm_generate_virtual_topology(struct nm_leaf *target, unsigned int uid
     hlist_for_each_entry_safe(parent, h_tmp, &pending, ht_node) {
         hlist_del(&parent->ht_node);
         if (!err) hash_add(nm_leaves_ht, &parent->ht_node, parent->v_hash);
-        else {
-            nm_delete_child_locked(parent, false);
-            nm_retire_leaf_locked(parent);
-        }
+        else nm_unlink_or_keep_leaf_locked(parent);
     }
     return err;
 }
@@ -2391,8 +2396,7 @@ static int nm_add_rule_locked(const char *v_path, const char *r_path, u16 v_len,
         if (leaf->this_dir && !READ_ONCE(leaf->this_dir->owner))
             smp_store_release(&leaf->this_dir->owner, leaf);
         if ((err = nm_generate_virtual_topology(leaf, uid))) {
-            nm_delete_child_locked(leaf, false);
-            nm_retire_leaf_locked(leaf);
+            nm_unlink_or_keep_leaf_locked(leaf);
             return err;
         }
         hash_add(nm_leaves_ht, &leaf->ht_node, leaf->v_hash);
@@ -2471,7 +2475,10 @@ static void nm_clear_state(int clear_flags)
         struct hlist_node *tmp;
         int bkt;
         hash_for_each_safe(nm_leaves_ht, bkt, tmp, leaf, ht_node) {
-            nm_delete_child_locked(leaf, true);
+            struct nm_dir_node *parent = leaf->parent_dir;
+
+            if (IS_ERR(nm_delete_child_locked(leaf, true)) && parent)
+                nm_publish_child_view_locked(parent, NULL);
             hash_del(&leaf->ht_node);
             nm_retire_leaf_locked(leaf);
         }
