@@ -112,6 +112,29 @@ static struct nm_leaf *nm_find_leaf_in_dir(struct nm_dir_node *dir_node, const c
     return NULL;
 }
 
+/*
+ * Dcache probe for a backing name. A hit skips the re-parse and the
+ * inode_permission() that lookup_one_len_unlocked() repeats after link_path_walk
+ * already checked this component; a miss falls back to that helper.
+ */
+static struct dentry *nm_backing_lookup(struct dentry *parent, struct inode *parent_inode,
+                                        const char *name, size_t len)
+{
+    struct qstr q = QSTR_INIT(name, len);
+    struct dentry *d;
+    int err;
+
+    d = nm_hash_and_lookup(parent, &q);
+    if (d) {
+        err = nm_call_orig_revalidate(d->d_op, parent_inode, &q, d, 0);
+        if (likely(err > 0)) return d;
+        if (!err) d_invalidate(d);
+        dput(d);
+        if (err < 0) return ERR_PTR(err);
+    }
+    return nm_lookup_one_len_unlocked(name, parent, len);
+}
+
 static bool nm_backing_gone(struct dentry *d)
 {
     struct inode *inode = READ_ONCE(d->d_inode);
@@ -1065,7 +1088,7 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
     {
         struct dentry *backing;
 
-        if (IS_ERR((backing = nm_lookup_one_len_unlocked(dentry->d_name.name, info->r_path.dentry, dentry->d_name.len))))
+        if (IS_ERR((backing = nm_backing_lookup(info->r_path.dentry, dir, dentry->d_name.name, dentry->d_name.len))))
             return backing;
         if (d_is_negative(backing)) {
             dput(backing);
@@ -1269,7 +1292,7 @@ static int nm_d_revalidate_common(struct inode *parent_inode, const struct qstr 
             if (!backing_parent)
                 return nm_drop_dentry(dentry, flags, weak);
 
-            backing = nm_lookup_one_len_unlocked(name->name, backing_parent, name->len);
+            backing = nm_backing_lookup(backing_parent, parent_inode, name->name, name->len);
             if (IS_ERR(backing)) return PTR_ERR(backing);
             valid = (backing == info->r_path.dentry && d_is_positive(backing) && nm_inode_matches_attrs(inode, d_inode(backing)));
             dput(backing);
