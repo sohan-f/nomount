@@ -420,6 +420,22 @@ struct nm_del_hdr {
 # define DCACHE_DONTCACHE 0
 #endif
 
+/* Cheap "nothing changed behind the proxy" test for the attribute fast paths. */
+static inline bool nm_inode_attrs_current(struct inode *v_inode, struct inode *r_inode)
+{
+    struct timespec64 a, b;
+
+    if (i_size_read(v_inode) != i_size_read(r_inode)) return false;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+    a = inode_get_ctime(v_inode);
+    b = inode_get_ctime(r_inode);
+#else
+    a = v_inode->i_ctime;
+    b = r_inode->i_ctime;
+#endif
+    return timespec64_equal(&a, &b);
+}
+
 static inline void nm_sync_inode_times(struct inode *v_inode, struct inode *r_inode)
 {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)

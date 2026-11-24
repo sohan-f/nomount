@@ -976,17 +976,22 @@ static int nm_getattr(IDMAP_ARG const struct path *path, struct kstat *stat, u32
     int res = 0;
 
     if (unlikely(!info)) return -EIO;
-    if (unlikely(!info->r_path.dentry))
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
-        generic_fillattr(IDMAP_CALL request_mask, v_inode, stat);
-#else
-        generic_fillattr(IDMAP_CALL v_inode, stat);
-#endif
-    else
+    struct inode *r_inode = info->r_path.dentry ? d_backing_inode(info->r_path.dentry) : NULL;
+
+    if (!r_inode)
+        goto fill;
+    if (!nm_inode_attrs_current(v_inode, r_inode))
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 11, 0)
         res = vfs_getattr_nosec(&info->r_path, stat);
 #else
         res = vfs_getattr_nosec(&info->r_path, stat, request_mask, query_flags);
+#endif
+    else
+fill:
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+        generic_fillattr(IDMAP_CALL request_mask, v_inode, stat);
+#else
+        generic_fillattr(IDMAP_CALL v_inode, stat);
 #endif
 
     if (likely(res == 0)) {
