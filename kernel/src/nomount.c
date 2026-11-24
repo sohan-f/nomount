@@ -215,6 +215,14 @@ static void nm_drain_work_fn(struct work_struct *work)
 
 static DECLARE_WORK(nm_drain_work, nm_drain_work_fn);
 
+static void nm_flush_drain_work(void)
+{
+    /* A flush can finish before a requeue; all queued drains must execute. */
+    do {
+        flush_work(&nm_drain_work);
+    } while (work_busy(&nm_drain_work));
+}
+
 static void nm_dir_rcu_free(struct rcu_head *head)
 {
     struct nm_dir_node *dir = container_of(head, struct nm_dir_node, rcu);
@@ -2106,14 +2114,14 @@ static void nm_shutdown_release(void)
     nm_lifecycle_lock();
     if (READ_ONCE(nm_shutdown_released)) {
         nm_lifecycle_unlock();
-        cancel_work_sync(&nm_drain_work);
+        nm_flush_drain_work();
         return;
     }
     nm_block_new_operations();
     nm_clear_state(NM_CLEAR_UIDS | NM_CLEAR_RULES);
     nm_shutdown_evict();
     nm_lifecycle_unlock();
-    cancel_work_sync(&nm_drain_work);
+    nm_flush_drain_work();
 }
 
 static struct nm_rule_array nm_virtual_parent_rules = {
@@ -2703,7 +2711,7 @@ static void __exit nomount_exit(void)
     nm_clear_state(NM_CLEAR_UIDS | NM_CLEAR_RULES | NM_CLEAR_EXIT);
     nm_drain_reclaim();
     nm_lifecycle_unlock();
-    cancel_work_sync(&nm_drain_work);
+    nm_flush_drain_work();
     nm_info("Unloaded successfully\n");
 }
 
