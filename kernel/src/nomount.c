@@ -230,6 +230,13 @@ static inline void nm_destroy_hijacked_inode(struct inode *inode)
     kfree_rcu(ops, rcu);
 }
 
+#define NM_PROBE_MAX 64
+
+struct nm_probe {
+    u32 hash;
+    u16 len;
+};
+
 struct nm_proxy_ctx {
     struct dir_context ctx;
     struct dir_context *orig_ctx;
@@ -237,7 +244,23 @@ struct nm_proxy_ctx {
     uid_t fsuid;
     bool emitted;
     bool native_view;
+    const struct nm_probe *probe;
+    u32 probe_n;
 };
+
+/* A hit only means "re-check this name"; the exact verdict stays in the visitor. */
+static __always_inline bool nm_probe_hit(const struct nm_probe *probe, u32 n, const char *name, int len)
+{
+    if (n <= 4) {
+        for (u32 i = 0; i < n; i++)
+            if (probe[i].len == len) return true;
+        return false;
+    }
+    u32 hash = nm_name_hash(name, len);
+    for (u32 i = 0; i < n; i++)
+        if (probe[i].hash == hash && probe[i].len == len) return true;
+    return false;
+}
 
 static bool nm_rule_needs_readdir(struct nm_leaf *leaf, struct nm_rule *rule)
 {
@@ -251,6 +274,8 @@ static NM_ACTOR_RET nm_actor_proxy(struct dir_context *ctx, const char *name, in
     NM_ACTOR_RET ret;
 
     if (likely(namelen > 0 && !(namelen <= 2 && name[0] == '.' && (namelen == 1 || name[1] == '.')))) {
+        if (proxy->probe && !nm_probe_hit(proxy->probe, proxy->probe_n, name, namelen))
+            goto emit;
         rcu_guard();
         struct nm_leaf *leaf = nm_find_leaf_in_dir(proxy->dir_node, name, namelen);
         struct nm_rule *rule = leaf ? nm_select_rule(leaf, proxy->fsuid) : NULL;
@@ -260,6 +285,7 @@ static NM_ACTOR_RET nm_actor_proxy(struct dir_context *ctx, const char *name, in
         }
     }
 
+emit:
     orig_ctx->pos = proxy->ctx.pos;
     ret = orig_ctx->actor(orig_ctx, name, namelen, offset, ino, d_type);
     proxy->ctx.pos = orig_ctx->pos;
@@ -524,9 +550,30 @@ static int nm_iterate_view(struct file *file, struct dir_context *ctx, const str
     if (unlikely(uid_blocked || !dir_node))
         return nm_call_iterate(real_file, ctx, fop);
 
+    struct nm_probe probe[NM_PROBE_MAX];
+    bool probe_valid = false;
+    u32 probe_n = 0;
+    rcu_read_lock();
+    struct nm_child_array *children = rcu_dereference(dir_node->children);
+    if (children && (u32)children->count <= NM_PROBE_MAX) {
+        for (u32 i = 0; i < (u32)children->count; i++) {
+            struct nm_leaf *leaf = nm_entries(children)[i].leaf;
+            struct nm_rule *rule = nm_select_rule(leaf, fsuid);
+
+            if (!rule || (native_view && !nm_rule_needs_readdir(leaf, rule)))
+                continue;
+            probe[probe_n].hash = nm_entries(children)[i].hash;
+            probe[probe_n].len = leaf->child_len;
+            probe_n++;
+        }
+        probe_valid = true;
+    }
+    rcu_read_unlock();
+
     struct nm_proxy_ctx proxy_ctx = {
         .ctx.actor = nm_actor_proxy, .ctx.pos = ctx->pos, .orig_ctx = ctx,
         .dir_node = dir_node, .fsuid = fsuid, .native_view = native_view,
+        .probe = probe_valid ? probe : NULL, .probe_n = probe_n,
     };
     res = nm_call_iterate(real_file, &proxy_ctx.ctx, fop);
     ctx->pos = proxy_ctx.ctx.pos;
