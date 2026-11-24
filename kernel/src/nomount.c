@@ -116,6 +116,7 @@ static bool nm_resolve_rule_from_leaf(struct nm_leaf *leaf, uid_t fsuid, struct 
     if (!rule) return false;
 
     out->flags = rule->flags;
+    out->backing_child = false;
     out->v_ino = leaf->v_ino;
     out->r_path = rule->r_path;
     out->this_dir = (rule->flags & NM_FLAG_IS_DIR) ? leaf->this_dir : NULL;
@@ -418,16 +419,16 @@ static struct dentry *nm_materialize_rule(struct inode *dir, struct dentry *dent
 
     if (rule_info->flags & NM_FLAG_WHITEOUT) goto negative_dentry;
     if (flags & LOOKUP_RENAME_TARGET) { res = ERR_PTR(-EPERM); goto out; }
-    if (rule_info->r_path.dentry) {
+    if (rule_info->r_path.dentry && !rule_info->backing_child) {
         int err = nm_rebind_path(rule_info);
         if (err) goto negative_dentry;
     }
 
-    probe = (struct nm_inode_info){
-        .r_path = rule_info->r_path, .dir_node = rule_info->this_dir,
-        .opaque = rule_info->this_dir && (rule_info->flags & NM_FLAG_OPAQUE),
-        .backing_child = rule_info->backing_child,
-    };
+    probe.r_path = rule_info->r_path;
+    probe.dir_node = rule_info->this_dir;
+    probe.r_file = NULL;
+    probe.opaque = rule_info->this_dir && (rule_info->flags & NM_FLAG_OPAQUE);
+    probe.backing_child = rule_info->backing_child;
     if (rule_info->leaf) probe.leaf = rule_info->leaf;
     inode = iget5_locked(dir->i_sb, rule_info->key, nm_cached_inode_test, nm_cached_inode_set, &probe);
     if (!inode) goto out;
@@ -461,7 +462,7 @@ out:
 static struct dentry *nm_hijacked_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
 {
     const struct inode_operations *orig_iop;
-    struct nm_rule_info rule_info = {0};
+    struct nm_rule_info rule_info;
     struct nm_dir_ops *nm_iop = NULL;
     struct dentry *res, *target;
     bool found = false, has_leaf = false;
@@ -475,7 +476,16 @@ static struct dentry *nm_hijacked_lookup(struct inode *dir, struct dentry *dentr
         has_leaf = leaf != NULL;
         if (has_leaf) {
             uid_t fsuid = current_fsuid().val;
-            if (likely(!nm_is_uid_blocked(fsuid))) found = nm_resolve_rule_from_leaf(leaf, fsuid, &rule_info);
+            struct nm_rule *rule;
+
+            if (likely(!nm_is_uid_blocked(fsuid))) {
+                if (unlikely(flags & LOOKUP_RENAME_TARGET) && (rule = nm_select_rule(leaf, fsuid)) &&
+                    !(rule->flags & NM_FLAG_WHITEOUT)) {
+                    rcu_read_unlock();
+                    return ERR_PTR(-EPERM);
+                }
+                found = nm_resolve_rule_from_leaf(leaf, fsuid, &rule_info);
+            }
         }
     }
     rcu_read_unlock();
@@ -940,7 +950,7 @@ static int nm_dir_iterate_dir(struct file *file, struct dir_context *ctx)
 static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
 {
     struct nm_inode_info *info = dir->i_private;
-    struct nm_rule_info rule_info = {0};
+    struct nm_rule_info rule_info;
     struct inode *r_dir;
     uid_t fsuid;
     bool uid_blocked, found = false;
@@ -951,7 +961,16 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
     uid_blocked = nm_is_uid_blocked((fsuid = current_fsuid().val));
     rcu_read_lock();
     struct nm_leaf *leaf = nm_find_leaf_in_dir(READ_ONCE(info->dir_node), dentry->d_name.name, dentry->d_name.len);
-    if (leaf && !uid_blocked) found = nm_resolve_rule_from_leaf(leaf, fsuid, &rule_info);
+    if (leaf && !uid_blocked) {
+        struct nm_rule *rule;
+
+        if (unlikely(flags & LOOKUP_RENAME_TARGET) && (rule = nm_select_rule(leaf, fsuid)) &&
+            !(rule->flags & NM_FLAG_WHITEOUT)) {
+            rcu_read_unlock();
+            return ERR_PTR(-EPERM);
+        }
+        found = nm_resolve_rule_from_leaf(leaf, fsuid, &rule_info);
+    }
     rcu_read_unlock();
     if (found) return nm_materialize_rule(dir, dentry, &rule_info, flags);
 
@@ -975,15 +994,15 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
             dput(backing);
             return ERR_PTR(-ELOOP);
         }
-        rule_info = (struct nm_rule_info){
-            .r_path = { .mnt = info->r_path.mnt },
-            .v_ino = d_inode(backing)->i_ino,
-            .key = (unsigned long)backing,
-            .backing_child = true,
-        };
-        rule_info.r_path.dentry = backing;
-        path_get(&rule_info.r_path);
-        dput(backing);
+        rule_info.flags = 0;
+        rule_info.backing_child = true;
+        rule_info.v_ino = d_inode(backing)->i_ino;
+        rule_info.key = (unsigned long)backing;
+        rule_info.this_dir = NULL;
+        rule_info.leaf = NULL;
+        rule_info.r_path.mnt = info->r_path.mnt;
+        mntget(rule_info.r_path.mnt);
+        rule_info.r_path.dentry = backing;      /* transfers the lookup ref */
         return nm_materialize_rule(dir, dentry, &rule_info, flags);
     }
 
