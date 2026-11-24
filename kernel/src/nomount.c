@@ -1069,6 +1069,27 @@ static bool nm_is_our_dops(struct nm_dir_ops *iop, const struct dentry_operation
     return dop == &nm_dops || (iop && dop == &iop->fake_dops);
 }
 
+/* RCU-callable: the pinned child must still be the dentry its name resolves to. */
+static __always_inline bool nm_backing_child_valid(struct inode *parent_inode, struct inode *inode,
+                                                   const struct qstr *name, const struct nm_inode_info *info)
+{
+    struct nm_inode_info *pinfo;
+    struct dentry *backing_parent, *d;
+    struct inode *r_inode;
+
+    if (info->opaque) return false;
+    pinfo = READ_ONCE(parent_inode->i_private);
+    backing_parent = pinfo ? READ_ONCE(pinfo->r_path.dentry) : NULL;
+    d = READ_ONCE(info->r_path.dentry);
+    if (!backing_parent || !d || d_unlinked(d) || !d_really_is_positive(d))
+        return false;
+    if (d->d_parent != backing_parent || d->d_name.len != name->len ||
+        memcmp(d->d_name.name, name->name, name->len))
+        return false;
+    r_inode = d_backing_inode(d);
+    return r_inode && nm_inode_matches_attrs(inode, r_inode);
+}
+
 static int nm_d_revalidate_common(struct inode *parent_inode, const struct qstr *name,
                                   struct dentry *dentry, unsigned int flags, bool weak)
 {
@@ -1078,6 +1099,7 @@ static int nm_d_revalidate_common(struct inode *parent_inode, const struct qstr 
     struct nm_dir_ops *iop = NULL;
     struct nm_rule *rule;
     bool has_rule = false, whiteout = false, match_rule = false, uid_blocked = false;
+    bool backing_ok = false;
     uid_t fsuid;
 
     if (unlikely(!parent_inode)) return 1;
@@ -1110,11 +1132,14 @@ static int nm_d_revalidate_common(struct inode *parent_inode, const struct qstr 
         }
     }
 
+    if (!has_rule && bound && bound->backing_child)
+        backing_ok = nm_backing_child_valid(parent_inode, inode, name, bound);
+
     if (!has_rule) orig_dops = nm_get_orig_dops(iop);
     rcu_read_unlock();
 
     if (whiteout && !inode) return weak ? 0 : 1;
-    if (match_rule) return 1;
+    if (match_rule || backing_ok) return 1;
     if (!has_rule && inode && nm_inode_is_virtual(inode)) {
         struct nm_inode_info *info = READ_ONCE(inode->i_private);
         if (info && info->backing_child) {
