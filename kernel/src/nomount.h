@@ -9,6 +9,7 @@
 #include <linux/workqueue.h>
 #include <linux/rwsem.h>
 #include <linux/atomic.h>
+#include <linux/percpu-refcount.h>
 #include <linux/file.h>
 #include <linux/magic.h>
 #include <linux/exportfs.h>
@@ -106,7 +107,7 @@ struct nm_dir_node {
     struct rcu_head rcu;
     struct nm_child_array __rcu *children;
     int readdir_count;
-    atomic_t refs;
+    struct percpu_ref refs;
     struct dentry *pinned_dentry;
     struct nm_leaf *owner;
 };
@@ -138,7 +139,7 @@ struct nm_leaf {
     u16 child_len;
     bool native_file;
     u16 child_hash;
-    atomic_t refs;
+    struct percpu_ref refs;
     union { struct hlist_node ht_node; struct nm_leaf *next; struct rcu_head rcu; };
     char paths[];
 };

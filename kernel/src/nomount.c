@@ -12,6 +12,7 @@
 
 static u32 nm_rule_gen;
 static struct kmem_cache *nm_inode_cache;
+static void nm_leaf_release(struct percpu_ref *ref);
 
 /* The caller already holds rcu_read_lock(); nm_is_uid_blocked() takes its own. */
 static __always_inline bool nm_is_uid_blocked_rcu(uid_t target_uid)
@@ -153,9 +154,9 @@ static bool nm_resolve_rule_from_leaf(struct nm_leaf *leaf, uid_t fsuid, struct 
     out->this_dir = (rule->flags & NM_FLAG_IS_DIR) ? leaf->this_dir : NULL;
     out->key = (unsigned long)(out->this_dir ? (void *)out->this_dir : (void *)leaf);
     out->leaf = (rule->flags & (NM_FLAG_IS_DIR | NM_FLAG_WHITEOUT)) ? NULL : leaf;
-    if (out->leaf) atomic_inc(&out->leaf->refs);
+    if (out->leaf) percpu_ref_get(&out->leaf->refs);
     if (out->r_path.dentry) path_get(&out->r_path);
-    if (out->this_dir) atomic_inc(&out->this_dir->refs);
+    if (out->this_dir) percpu_ref_get(&out->this_dir->refs);
     return true;
 }
 
@@ -221,13 +222,18 @@ static void nm_dir_rcu_free(struct rcu_head *head)
     struct nm_dir_node *dir = container_of(head, struct nm_dir_node, rcu);
     if (dir->pinned_dentry) dput(dir->pinned_dentry);
     kfree(rcu_dereference_raw(dir->children));
+    percpu_ref_exit(&dir->refs);
     kfree(dir);
+}
+
+static void nm_dir_release(struct percpu_ref *ref)
+{
+    call_rcu(&container_of(ref, struct nm_dir_node, refs)->rcu, nm_dir_rcu_free);
 }
 
 static void nm_dir_put(struct nm_dir_node *dir_node)
 {
-    if (dir_node && atomic_dec_and_test(&dir_node->refs))
-        call_rcu(&dir_node->rcu, nm_dir_rcu_free);
+    if (dir_node) percpu_ref_put(&dir_node->refs);
 }
 
 static void nm_inode_info_rcu_free(struct rcu_head *head)
@@ -1538,7 +1544,7 @@ static inline int nm_hijack_dir_ops(struct nm_dir_node *dir_node, struct inode *
         if (fop->iterate) ops->fake_fop.iterate = nm_hijacked_iterate_dir;
 #endif
     }
-    atomic_inc(&dir_node->refs);
+    percpu_ref_get(&dir_node->refs);
     if (iop) smp_store_release(&inode->i_op, &ops->fake_iop);
     if (fop) smp_store_release(&inode->i_fop, &ops->fake_fop);
 
@@ -1696,7 +1702,12 @@ static void nm_restore_superblocks(void)
 static struct nm_dir_node *nm_alloc_dir_node(void)
 {
     struct nm_dir_node *dir_node = kzalloc(sizeof(*dir_node), GFP_KERNEL);
-    if (dir_node) atomic_set(&dir_node->refs, 1);
+
+    if (!dir_node) return NULL;
+    if (percpu_ref_init(&dir_node->refs, nm_dir_release, 0, GFP_KERNEL)) {
+        kfree(dir_node);
+        return NULL;
+    }
     return dir_node;
 }
 
@@ -1789,7 +1800,7 @@ static int nm_inject_child_locked(struct nm_dir_node *dir_node, struct nm_leaf *
     } else nm_rebuild_children(array, old, child, -1);
 
     leaf->parent_dir = dir_node;
-    atomic_inc(&dir_node->refs);
+    percpu_ref_get(&dir_node->refs);
     if (nm_rules_need_readdir(leaf, rcu_dereference_protected(leaf->rules, lockdep_is_held(&nm_mutex))))
         WRITE_ONCE(dir_node->readdir_count, dir_node->readdir_count + 1);
     nm_publish_child_view_locked(dir_node, array);
@@ -1910,9 +1921,12 @@ static inline void nm_copy_rule(struct nm_rule *dst, const struct nm_rule *src)
 static struct nm_leaf *nm_alloc_leaf(const char *path, u16 len, u32 hash)
 {
     struct nm_leaf *leaf = kzalloc(sizeof(*leaf) + len + 1, GFP_KERNEL);
-    if (!leaf) return ERR_PTR(-ENOMEM);
 
-    atomic_set(&leaf->refs, 1);
+    if (!leaf) return ERR_PTR(-ENOMEM);
+    if (percpu_ref_init(&leaf->refs, nm_leaf_release, 0, GFP_KERNEL)) {
+        kfree(leaf);
+        return ERR_PTR(-ENOMEM);
+    }
     memcpy(leaf->paths, path, len);
     leaf->v_len = len;
     leaf->v_hash = hash;
@@ -1944,23 +1958,46 @@ static void nm_resolve_anchor_locked(struct nm_leaf *leaf)
         dir = ops ? ops->dir_node : NULL;
         if (dir && !READ_ONCE(dir->owner)) {
             leaf->this_dir = dir;
-            atomic_inc(&dir->refs);
+            percpu_ref_get(&dir->refs);
         }
     }
 }
 
-static void nm_free_leaf(struct nm_leaf *leaf, bool deferred)
+static void nm_leaf_destroy(struct nm_leaf *leaf)
 {
     if (leaf->anchor.dentry) path_put(&leaf->anchor);
     nm_dir_put(leaf->this_dir);
     nm_dir_put(leaf->parent_dir);
-    if (deferred) kfree_rcu(leaf, rcu);
-    else kfree(leaf);
+}
+
+static void nm_leaf_rcu_free(struct rcu_head *head)
+{
+    struct nm_leaf *leaf = container_of(head, struct nm_leaf, rcu);
+
+    percpu_ref_exit(&leaf->refs);
+    nm_leaf_destroy(leaf);
+    kfree(leaf);
+}
+
+static void nm_leaf_release(struct percpu_ref *ref)
+{
+    call_rcu(&container_of(ref, struct nm_leaf, refs)->rcu, nm_leaf_rcu_free);
+}
+
+static void nm_free_leaf(struct nm_leaf *leaf, bool deferred)
+{
+    if (deferred) {
+        nm_leaf_release(&leaf->refs);
+        return;
+    }
+    percpu_ref_exit(&leaf->refs);
+    nm_leaf_destroy(leaf);
+    kfree(leaf);
 }
 
 static void nm_leaf_put(struct nm_leaf *leaf)
 {
-    if (leaf && atomic_dec_and_test(&leaf->refs)) nm_free_leaf(leaf, true);
+    if (leaf) percpu_ref_put(&leaf->refs);
 }
 
 static void nm_rule_array_free(struct nm_rule_array *arr)
@@ -2109,13 +2146,13 @@ static int nm_generate_virtual_topology(struct nm_leaf *target, unsigned int uid
                 err = -ENOTDIR;
             } else if (virtual) {
                 dir = ((struct nm_inode_info *)inode->i_private)->dir_node;
-                if (dir) atomic_inc(&dir->refs);
+                if (dir) percpu_ref_get(&dir->refs);
                 else err = -EOPNOTSUPP;
             } else {
                 struct nm_dir_ops *ops = nm_get_nm_iop(smp_load_acquire(&inode->i_op));
                 if (!ops) ops = nm_get_nm_fop(smp_load_acquire(&inode->i_fop));
                 dir = ops ? ops->dir_node : NULL;
-                if (dir) atomic_inc(&dir->refs);
+                if (dir) percpu_ref_get(&dir->refs);
                 else dir = nm_alloc_dir_node();
                 if (!dir) err = -ENOMEM;
             }
