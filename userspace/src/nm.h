@@ -215,7 +215,7 @@ struct nm_walk {
     size_t root_len;
     int has_injectable;
     int error;
-    char path[PATH_MAX];
+    char path[PATH_MAX], vpath[PATH_MAX];
 };
 
 static char *nm_strdup(const char *s) {
@@ -534,14 +534,25 @@ static int nm_is_partition(const char *p, size_t len) {
 }
 
 static const char *nm_vpath(const struct nm_walk *ctx) {
-    const char *path = ctx->path + ctx->root_len;
-    if (!strncmp(path, "/system/", 8)) {
-        const char *part = path + 8;
+    const char *p = ctx->path + ctx->root_len;
+    char *o = (char *)ctx->vpath;
+    if (!strncmp(p, "/system/", 8)) {
+        const char *part = p + 8;
         size_t len = 0;
         while (part[len] && part[len] != '/') len++;
-        if (nm_is_partition(part, len)) return path + 7;
+        if (nm_is_partition(part, len)) p += 7;
     }
-    return path;
+    while (*p) {
+        if (*p == '/') { *o++ = *p++; continue; }
+        const char *seg = p;
+        size_t n = 0;
+        while (p[n] && p[n] != '/') n++;
+        if (!(n == 8 && !memcmp(seg, ".replace", 8))) { memcpy(o, seg, n); o += n; }
+        p += n;
+    }
+    while (o > ctx->vpath && o[-1] == '/') o--;
+    *o = '\0';
+    return ctx->vpath;
 }
 
 static noinline int nm_path_join(char *dst, size_t dst_size, const char *a, const char *b) {
@@ -750,7 +761,7 @@ static int nm_marker(int fd, const char *name) {
     if (fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW)) return errno == ENOENT ? 0 : -errno;
     if (S_ISLNK(st.st_mode) && fstatat(fd, name, &st, 0))
         return errno == ENOENT || errno == ENOTDIR ? 1 : -errno;
-    return !S_ISDIR(st.st_mode);
+    return 1;
 }
 
 static int nm_directory_rule(int fd, int check_contents) {
@@ -773,7 +784,7 @@ static int nm_directory_rule(int fd, int check_contents) {
 static int nm_walk_module(struct nm_walk *ctx, int parent_fd, const char *name,
                            unsigned char type, const struct nm_ancestor *parent) {
     struct stat st;
-    int rc = 0;
+    int rc = 0, link = 0;
     if (type == DT_UNKNOWN) {
         if (fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW)) return -errno;
         type = st.st_mode >> 12;
@@ -781,8 +792,10 @@ static int nm_walk_module(struct nm_walk *ctx, int parent_fd, const char *name,
     if (type == DT_LNK) {
         if (fstatat(parent_fd, name, &st, 0)) return errno == ENOENT || errno == ENOTDIR ? 0 : -errno;
         type = st.st_mode >> 12;
-        if (ctx->catalog && (rc = nm_collect_mapping(ctx, type == DT_DIR ? NM_FLAG_VIRTUAL_DIR : 0))) return rc;
+        link = 1;
     }
+    int replaced_dir = type == DT_DIR && !strcmp(name, ".replace");
+    if (link && ctx->catalog && (rc = nm_collect_mapping(ctx, type == DT_DIR ? NM_FLAG_VIRTUAL_DIR : 0))) return rc;
     if (type != DT_DIR) {
         if (!strcmp(name, ".replace") || !strcmp(name, ".remove")) return 0;
         if (type == DT_CHR) nm_emit(ctx, NM_FLAG_WHITEOUT);
@@ -798,8 +811,8 @@ static int nm_walk_module(struct nm_walk *ctx, int parent_fd, const char *name,
     unsigned cmd = ctx->payload ? ctx->payload->cmd : NM_CMD_UNSPEC;
     int flags = nm_directory_rule(dirfd(d), cmd != NM_CMD_DEL_RULE);
     if (flags < 0) { rc = flags; goto done; }
-    if (flags) nm_emit(ctx, flags);
-    if (flags == NM_FLAG_WHITEOUT && cmd != NM_CMD_DEL_RULE) goto done;
+    if (flags && !replaced_dir) nm_emit(ctx, flags);
+    if (flags == NM_FLAG_WHITEOUT && cmd != NM_CMD_DEL_RULE && !replaced_dir) goto done;
     size_t len = strlen(ctx->path);
     for (;;) {
         errno = 0;

@@ -2046,7 +2046,7 @@ static int nm_inject_child_immediate_locked(struct nm_dir_node *dir_node, struct
     if (nm_find_leaf_in_dir(dir_node, name, name_len)) return -EEXIST;
     leaf->child_len = name_len;
     struct nm_child child = { .leaf = leaf, .hash = nm_name_hash(name, name_len) };
-    leaf->child_hash = (u16)child.hash;
+    leaf->child_hash = child.hash;
 
     if (!(array = nm_alloc_child_array(count + 1))) return -ENOMEM;
     if (old && old->bucket_slots && array->bucket_slots == old->bucket_slots) {
@@ -2127,7 +2127,7 @@ static int nm_inject_child_locked(struct nm_dir_node *dir_node, struct nm_leaf *
 
     leaf->child_len = name_len;
     child = (struct nm_child){ .leaf = leaf, .hash = nm_name_hash(name, name_len) };
-    leaf->child_hash = (u16)child.hash;
+    leaf->child_hash = child.hash;
     leaf->pending_index = pending->count;
     nm_entries(pending)[pending->count] = child;
     nm_entries(pending)[pending->count].next = dir_node->pending_buckets[child.hash & (NM_PENDING_BUCKETS - 1)];
@@ -2520,6 +2520,14 @@ static void nm_retire_leaf_locked(struct nm_leaf *leaf)
     else schedule_work(&nm_reclaim_work);
 }
 
+static void nm_unlink_or_keep_leaf_locked(struct nm_leaf *leaf)
+{
+    if (IS_ERR(nm_delete_child_locked(leaf, false)))
+        hash_add(nm_leaves_ht, &leaf->ht_node, leaf->v_hash);
+    else
+        nm_retire_leaf_locked(leaf);
+}
+
 static void nm_prepare_native_file(struct nm_leaf *leaf, struct nm_dir_node *dir_node, const struct path *parent, const char *name)
 {
     switch (parent->dentry->d_sb->s_magic) {
@@ -2630,10 +2638,7 @@ static int nm_generate_virtual_topology(struct nm_leaf *target, unsigned int uid
     hlist_for_each_entry_safe(parent, h_tmp, &pending, ht_node) {
         hlist_del(&parent->ht_node);
         if (!err) hash_add(nm_leaves_ht, &parent->ht_node, parent->v_hash);
-        else {
-            nm_delete_child_locked(parent, false);
-            nm_retire_leaf_locked(parent);
-        }
+        else nm_unlink_or_keep_leaf_locked(parent);
     }
     return err;
 }
@@ -2777,8 +2782,7 @@ static int nm_add_rule_locked(const char *v_path, const char *r_path, u16 v_len,
         if (leaf->this_dir && !READ_ONCE(leaf->this_dir->owner))
             smp_store_release(&leaf->this_dir->owner, leaf);
         if ((err = nm_generate_virtual_topology(leaf, uid))) {
-            nm_delete_child_locked(leaf, false);
-            nm_retire_leaf_locked(leaf);
+            nm_unlink_or_keep_leaf_locked(leaf);
             return err;
         }
         hash_add(nm_leaves_ht, &leaf->ht_node, leaf->v_hash);

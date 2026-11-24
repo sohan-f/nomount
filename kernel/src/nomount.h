@@ -148,10 +148,10 @@ struct nm_leaf {
     struct nm_dir_node *parent_dir;
     unsigned long v_ino;
     u32 v_hash;
+    u32 child_hash;
     u16 v_len;
     u16 child_len;
     bool native_file;
-    u16 child_hash;
     int pending_index;
     atomic_t refs;
     union { struct hlist_node ht_node; struct nm_leaf *next; struct rcu_head rcu; };
