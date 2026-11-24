@@ -2141,6 +2141,8 @@ static struct nm_dir_node *nm_delete_child_locked(struct nm_leaf *leaf, bool cle
     if (clear || !nm_child_batch_depth) return nm_delete_child_immediate_locked(leaf, clear);
     dir_node = leaf->parent_dir;
     if (!dir_node) return NULL;
+    if (!dir_node->pending && nm_find_leaf_in_dir(dir_node, nm_get_child_name(leaf), leaf->child_len) != leaf)
+        return dir_node;
 
     err = nm_pending_begin_locked(dir_node);
     if (err) return ERR_PTR(err);
