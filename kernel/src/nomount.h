@@ -58,6 +58,7 @@ struct nm_dir_ops {
     const struct file_operations *orig_fop;
     struct nm_dir_node *dir_node;
     const struct dentry_operations *orig_dops;
+    bool pseudo;
 
     struct inode_operations fake_iop;
     struct file_operations fake_fop;
@@ -196,7 +197,7 @@ extern int vfs_path_lookup(struct dentry *, struct vfsmount *, const char *, uns
 static struct dentry *nm_hijacked_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags);
 static int nm_hijacked_iterate_dir(struct file *file, struct dir_context *ctx);
 static void nm_hijacked_put_super(struct super_block *sb);
-static void nm_hijack_dentry_ops(struct inode *dir, struct dentry *dentry, bool injected);
+static void nm_hijack_dentry_ops(struct inode *dir, struct dentry *dentry, bool injected, bool shared);
 static void nm_dir_put(struct nm_dir_node *dir_node);
 static void nm_leaf_put(struct nm_leaf *leaf);
 static void nm_shutdown_release(void);

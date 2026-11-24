@@ -487,12 +487,12 @@ static struct dentry *nm_materialize_rule(struct inode *dir, struct dentry *dent
     }
     res = d_splice_alias(inode, dentry);
     if (!IS_ERR(res))
-        nm_hijack_dentry_ops(dir, res ? res : dentry, true);
+        nm_hijack_dentry_ops(dir, res ? res : dentry, true, res != NULL);
     if (info) return res;
     goto out;
 
 negative_dentry:
-    nm_hijack_dentry_ops(dir, dentry, true);
+    nm_hijack_dentry_ops(dir, dentry, true, false);
     d_add(dentry, NULL);
     res = NULL;
 out:
@@ -539,8 +539,8 @@ static struct dentry *nm_hijacked_lookup(struct inode *dir, struct dentry *dentr
 
     if (likely(orig_iop && orig_iop->lookup)) {
         target = (res = orig_iop->lookup(dir, dentry, flags)) ? res : dentry;
-        if (likely(!IS_ERR(target)) && has_leaf && !nm_is_pseudo_fs(dir->i_sb))
-            nm_hijack_dentry_ops(dir, target, false);
+        if (likely(!IS_ERR(target)) && has_leaf && !nm_iop->pseudo)
+            nm_hijack_dentry_ops(dir, target, false, true);
         return res;
     }
     return ERR_PTR(-EOPNOTSUPP);
@@ -1072,7 +1072,7 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
     }
 
 negative_dentry:
-    nm_hijack_dentry_ops(dir, dentry, true);
+    nm_hijack_dentry_ops(dir, dentry, true, false);
     d_add(dentry, NULL);
     return NULL;
 }
@@ -1452,6 +1452,7 @@ static inline int nm_hijack_dir_ops(struct nm_dir_node *dir_node, struct inode *
     ops->orig_fop = fop;
     ops->orig_dops = NULL;
     ops->dir_node = dir_node;
+    ops->pseudo = nm_is_pseudo_fs(inode->i_sb);
     if (iop) {
         ops->fake_iop = *iop;
         ops->fake_iop.lookup = nm_hijacked_lookup;
@@ -1476,7 +1477,7 @@ static inline int nm_hijack_dir_ops(struct nm_dir_node *dir_node, struct inode *
     return 0;
 }
 
-static void nm_hijack_dentry_ops(struct inode *dir, struct dentry *dentry, bool injected)
+static void nm_hijack_dentry_ops(struct inode *dir, struct dentry *dentry, bool injected, bool shared)
 {
 #define DCACHE_OPS (DCACHE_OP_HASH | DCACHE_OP_COMPARE | DCACHE_OP_DELETE | DCACHE_OP_PRUNE | DCACHE_OP_REAL)
     const struct dentry_operations *orig, *current_orig;
@@ -1487,6 +1488,13 @@ static void nm_hijack_dentry_ops(struct inode *dir, struct dentry *dentry, bool 
     iop = nm_get_nm_iop(smp_load_acquire(&dir->i_op));
     orig = READ_ONCE(dentry->d_op);
     if (unlikely(!injected && !iop && orig) || nm_is_our_dops(iop, orig)) return;
+
+    if (injected && !shared) {
+        dentry->d_op = &nm_dops;
+        WRITE_ONCE(dentry->d_flags, (dentry->d_flags & ~DCACHE_OPS) |
+                                   (DCACHE_OP_REVALIDATE | DCACHE_OP_WEAK_REVALIDATE));
+        return;
+    }
 
     spin_lock(&dentry->d_lock);
     orig = dentry->d_op;
@@ -1499,7 +1507,7 @@ static void nm_hijack_dentry_ops(struct inode *dir, struct dentry *dentry, bool 
         new_flags = dentry->d_flags & ~DCACHE_OPS;
         new_flags |= (DCACHE_OP_REVALIDATE | DCACHE_OP_WEAK_REVALIDATE);
         dentry->d_op = &nm_dops;
-        smp_store_release(&dentry->d_flags, new_flags);
+        WRITE_ONCE(dentry->d_flags, new_flags);
     } else if (iop) {
         if (unlikely((current_orig = smp_load_acquire(&iop->orig_dops)) != orig)) {
             if (current_orig == NULL) {
@@ -1516,7 +1524,7 @@ static void nm_hijack_dentry_ops(struct inode *dir, struct dentry *dentry, bool 
         }
         new_flags = dentry->d_flags | DCACHE_OP_REVALIDATE;
         dentry->d_op = &iop->fake_dops;
-        smp_store_release(&dentry->d_flags, new_flags);
+        WRITE_ONCE(dentry->d_flags, new_flags);
     }
 
     spin_unlock(&dentry->d_lock);
