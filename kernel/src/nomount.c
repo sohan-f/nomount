@@ -1288,8 +1288,8 @@ static int nm_d_revalidate_common(struct inode *parent_inode, const struct qstr 
         struct nm_inode_info *info = READ_ONCE(inode->i_private);
         if (info && info->backing_child) {
             struct nm_inode_info *pinfo;
-            struct dentry *backing, *backing_parent;
-            bool valid;
+            struct dentry *backing, *backing_parent, *old;
+            struct inode *r_inode;
 
             if (flags & LOOKUP_RCU) return -ECHILD;
             pinfo = READ_ONCE(parent_inode->i_private);
@@ -1299,9 +1299,34 @@ static int nm_d_revalidate_common(struct inode *parent_inode, const struct qstr 
 
             backing = nm_backing_lookup(backing_parent, parent_inode, name->name, name->len);
             if (IS_ERR(backing)) return PTR_ERR(backing);
-            valid = (backing == info->r_path.dentry && d_is_positive(backing) && nm_inode_matches_attrs(inode, d_inode(backing)));
-            dput(backing);
-            return valid ? 1 : nm_drop_dentry(dentry, flags, weak);
+            if (unlikely(!d_is_positive(backing))) {
+                dput(backing);
+                return nm_drop_dentry(dentry, flags, weak);
+            }
+            r_inode = d_backing_inode(backing);
+            if (unlikely(!r_inode || nm_inode_is_virtual(r_inode) ||
+                         ((r_inode->i_mode ^ inode->i_mode) & S_IFMT))) {
+                dput(backing);
+                return nm_drop_dentry(dentry, flags, weak);
+            }
+
+            old = READ_ONCE(info->r_path.dentry);
+            if (likely(backing == old && nm_inode_matches_attrs(inode, r_inode))) {
+                dput(backing);
+                return 1;
+            }
+
+            /* Rebind in place: the owned lookup ref moves into the binding. */
+            WRITE_ONCE(info->r_path.dentry, backing);
+            inode->i_ino = r_inode->i_ino;
+            inode->i_mode = nm_visible_mode(r_inode->i_mode);
+            inode->i_uid = r_inode->i_uid;
+            inode->i_gid = r_inode->i_gid;
+            i_size_write(inode, i_size_read(r_inode));
+            inode->i_blocks = r_inode->i_blocks;
+            nm_sync_inode_times(inode, r_inode);
+            dput(old);
+            return 1;
         }
     }
 
