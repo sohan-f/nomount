@@ -83,6 +83,8 @@ struct nm_inode_info {
     struct file *r_file;
     bool opaque;
     bool backing_child;
+    u32 bound_gen;
+    u32 bound_uid;
     struct rcu_head rcu;
 };
 

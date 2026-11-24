@@ -5,9 +5,12 @@
 #include <linux/cred.h>
 #include <linux/xattr.h>
 #include <linux/module.h>
+#include <linux/mount.h>
 #include "nomount.h"
 
 /*** Helpers ***/
+
+static u32 nm_rule_gen;
 
 /* The caller already holds rcu_read_lock(); nm_is_uid_blocked() takes its own. */
 static __always_inline bool nm_is_uid_blocked_rcu(uid_t target_uid)
@@ -410,6 +413,17 @@ static bool nm_inode_matches_binding(struct inode *inode, const struct path *pat
         return false;
     r_inode = path->dentry ? d_backing_inode(path->dentry) : NULL;
     return nm_inode_matches_attrs(inode, r_inode);
+}
+
+/* Checks the invariants a rule change cannot cover: the pin is live and matches. */
+static __always_inline bool nm_binding_still_valid(struct inode *inode, struct nm_inode_info *info)
+{
+    struct dentry *d = READ_ONCE(info->r_path.dentry);
+    struct inode *r_inode;
+
+    if (!d || d_unlinked(d)) return false;
+    r_inode = d_backing_inode(d);
+    return r_inode && nm_inode_matches_attrs(inode, r_inode);
 }
 
 static bool nm_binding_matches_rule(struct inode *inode, const struct nm_rule *rule)
@@ -1176,6 +1190,8 @@ static int nm_d_revalidate_common(struct inode *parent_inode, const struct qstr 
     if ((flags & LOOKUP_RENAME_TARGET) && inode && nm_inode_is_virtual(inode))
         return (flags & LOOKUP_RCU) ? -ECHILD : -EPERM;
 
+    fsuid = current_fsuid().val;
+
     rcu_read_lock();
     const struct inode_operations *parent_iop = rcu_dereference(parent_inode->i_op);
     if (parent_iop == &nm_dir_iops) {
@@ -1186,6 +1202,12 @@ static int nm_d_revalidate_common(struct inode *parent_inode, const struct qstr 
     }
 
     struct nm_inode_info *bound = inode && nm_inode_is_virtual(inode) ? rcu_dereference(inode->i_private) : NULL;
+    u32 gen = READ_ONCE(nm_rule_gen);
+    if (bound && !bound->backing_child && bound->bound_gen == gen && bound->bound_uid == fsuid &&
+        !nm_is_uid_blocked_rcu(fsuid) && nm_binding_still_valid(inode, bound)) {
+        rcu_read_unlock();
+        return 1;
+    }
     struct nm_leaf *leaf = !bound ? NULL : inode->i_op == &nm_file_iops ? bound->leaf :
                            bound->dir_node ? smp_load_acquire(&bound->dir_node->owner) : NULL;
     if (!leaf || leaf->parent_dir != parent_dir || !nm_child_matches(leaf, name->name, name->len) || !rcu_access_pointer(leaf->rules)) {
@@ -1194,7 +1216,7 @@ static int nm_d_revalidate_common(struct inode *parent_inode, const struct qstr 
         else
             leaf = NULL;
     }
-    if (leaf && !(uid_blocked = nm_is_uid_blocked_rcu((fsuid = current_fsuid().val))) && (rule = nm_select_rule(leaf, fsuid))) {
+    if (leaf && !(uid_blocked = nm_is_uid_blocked_rcu(fsuid)) && (rule = nm_select_rule(leaf, fsuid))) {
         has_rule = true;
         if (rule->flags & NM_FLAG_WHITEOUT)
             whiteout = true;
@@ -1203,6 +1225,10 @@ static int nm_d_revalidate_common(struct inode *parent_inode, const struct qstr 
                 match_rule = nm_inode_matches_binding(inode, &rule->r_path, leaf->this_dir, rule->flags & NM_FLAG_OPAQUE);
             else
                 match_rule = nm_binding_matches_rule(inode, rule);
+        }
+        if (match_rule) {
+            WRITE_ONCE(bound->bound_gen, gen);
+            WRITE_ONCE(bound->bound_uid, fsuid);
         }
     }
 
@@ -1923,6 +1949,7 @@ static void nm_publish_rules_locked(struct nm_leaf *leaf, struct nm_rule_array *
 
     if (parent && !before && after) WRITE_ONCE(parent->readdir_count, parent->readdir_count + 1);
     rcu_assign_pointer(leaf->rules, array);
+    WRITE_ONCE(nm_rule_gen, nm_rule_gen + 1);
     if (parent && before && !after) WRITE_ONCE(parent->readdir_count, parent->readdir_count - 1);
     if (old != &nm_virtual_parent_rules) nm_retire_array_locked(old);
 }
@@ -1932,6 +1959,7 @@ static void nm_retire_leaf_locked(struct nm_leaf *leaf)
     struct nm_rule_array *array = rcu_dereference_protected(leaf->rules, lockdep_is_held(&nm_mutex));
     if (leaf->this_dir) WRITE_ONCE(leaf->this_dir->owner, NULL);
     RCU_INIT_POINTER(leaf->rules, NULL);
+    WRITE_ONCE(nm_rule_gen, nm_rule_gen + 1);
     leaf->next = nm_retired_leaves;
     nm_retired_leaves = leaf;
     if (array != &nm_virtual_parent_rules) nm_retire_array_locked(array);
@@ -2167,6 +2195,7 @@ static int nm_add_rule_locked(const char *v_path, const char *r_path, u16 v_len,
         leaf->this_dir = new_dir;
     if (fresh) {
         RCU_INIT_POINTER(leaf->rules, array);
+        WRITE_ONCE(nm_rule_gen, nm_rule_gen + 1);
         if (leaf->this_dir && !READ_ONCE(leaf->this_dir->owner))
             smp_store_release(&leaf->this_dir->owner, leaf);
         if ((err = nm_generate_virtual_topology(leaf, uid))) {
