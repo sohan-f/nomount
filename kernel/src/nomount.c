@@ -1322,6 +1322,13 @@ static int nm_d_revalidate_common(struct inode *parent_inode, const struct qstr 
                 return 1;
             }
 
+            /* A cached file still reads the replaced object. */
+            struct file *rf = READ_ONCE(info->r_file);
+            if (unlikely(rf)) {
+                WRITE_ONCE(info->r_file, NULL);
+                fput(rf);
+            }
+
             /* Rebind in place: the owned lookup ref moves into the binding. */
             WRITE_ONCE(info->r_path.dentry, backing);
             inode->i_ino = r_inode->i_ino;
