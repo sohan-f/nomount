@@ -1224,10 +1224,19 @@ static struct dentry *nm_export_get_parent(struct dentry *child)
 
 static int nm_shutdown_sync_fs(struct super_block *sb, int wait)
 {
-    struct nm_sop *nm_sop = nm_get_nm_sop(smp_load_acquire(&sb->s_op));
+    const struct super_operations *orig_sop;
+    struct nm_sop *nm_sop;
+
+    rcu_read_lock();
+    if ((nm_sop = nm_get_nm_sop(rcu_dereference(sb->s_op))))
+        orig_sop = nm_sop->orig_sop;
+    else
+        orig_sop = NULL;
+    rcu_read_unlock();
+
     if (current->pid == 1) nm_shutdown_release();
-    if (nm_sop && nm_sop->orig_sop && nm_sop->orig_sop->sync_fs)
-        return nm_sop->orig_sop->sync_fs(sb, wait);
+    if (orig_sop && orig_sop->sync_fs)
+        return orig_sop->sync_fs(sb, wait);
     return 0;
 }
 
