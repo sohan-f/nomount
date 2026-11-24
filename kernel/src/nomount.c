@@ -640,13 +640,23 @@ static int nm_hijacked_unlink(struct inode *dir, struct dentry *dentry)
     if (unlikely(!inode))
         return -ENOENT;
 
-    orig_iop = smp_load_acquire(&dir->i_op);
+    rcu_read_lock();
+    orig_iop = rcu_dereference(dir->i_op);
     if ((nm_iop = nm_get_nm_iop(orig_iop)))
         orig_iop = nm_iop->orig_iop;
-    if (unlikely(!nm_iop || !nm_inode_is_virtual(inode) || nm_is_uid_blocked(fsuid)))
+    if (unlikely(!nm_iop || !nm_inode_is_virtual(inode) || nm_is_uid_blocked_rcu(fsuid))) {
+        rcu_read_unlock();
         goto do_real_unlink;
+    }
+    rcu_read_unlock();
 
-    if (!mutex_trylock(&nm_mutex)) return -EBUSY;
+    /* The ops record can be freed while sleeping; re-read it under the lock. */
+    mutex_lock(&nm_mutex);
+    if (!(nm_iop = nm_get_nm_iop(smp_load_acquire(&dir->i_op)))) {
+        mutex_unlock(&nm_mutex);
+        goto do_real_unlink;
+    }
+    orig_iop = nm_iop->orig_iop;
     dir_node = rcu_dereference_protected(nm_iop->dir_node, lockdep_is_held(&nm_mutex));
     leaf = nm_find_leaf_in_dir(dir_node, dentry->d_name.name, dentry->d_name.len);
     if (unlikely(!leaf || !(rule = nm_select_rule(leaf, fsuid)) || (!rule->target_uid && !rule->uid_end))) {
