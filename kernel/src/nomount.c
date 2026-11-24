@@ -959,8 +959,11 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
         goto negative_dentry;
 
     uid_blocked = nm_is_uid_blocked((fsuid = current_fsuid().val));
+    struct nm_dir_node *dir_node = READ_ONCE(info->dir_node);
     rcu_read_lock();
-    struct nm_leaf *leaf = nm_find_leaf_in_dir(READ_ONCE(info->dir_node), dentry->d_name.name, dentry->d_name.len);
+    struct nm_leaf *leaf = NULL;
+    if (dir_node && rcu_access_pointer(dir_node->children))
+        leaf = nm_find_leaf_in_dir(dir_node, dentry->d_name.name, dentry->d_name.len);
     if (leaf && !uid_blocked) {
         struct nm_rule *rule;
 
@@ -1137,8 +1140,12 @@ static int nm_d_revalidate_common(struct inode *parent_inode, const struct qstr 
     struct nm_inode_info *bound = inode && nm_inode_is_virtual(inode) ? rcu_dereference(inode->i_private) : NULL;
     struct nm_leaf *leaf = !bound ? NULL : inode->i_op == &nm_file_iops ? bound->leaf :
                            bound->dir_node ? smp_load_acquire(&bound->dir_node->owner) : NULL;
-    if (!leaf || leaf->parent_dir != parent_dir || !nm_child_matches(leaf, name->name, name->len) || !rcu_access_pointer(leaf->rules))
-        leaf = nm_find_leaf_in_dir(parent_dir, name->name, name->len);
+    if (!leaf || leaf->parent_dir != parent_dir || !nm_child_matches(leaf, name->name, name->len) || !rcu_access_pointer(leaf->rules)) {
+        if (parent_dir && rcu_access_pointer(parent_dir->children))
+            leaf = nm_find_leaf_in_dir(parent_dir, name->name, name->len);
+        else
+            leaf = NULL;
+    }
     if (leaf && !(uid_blocked = nm_is_uid_blocked((fsuid = current_fsuid().val))) && (rule = nm_select_rule(leaf, fsuid))) {
         has_rule = true;
         if (rule->flags & NM_FLAG_WHITEOUT)
