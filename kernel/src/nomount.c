@@ -323,9 +323,9 @@ static inline void nm_emit_virtual_children(struct dir_context *ctx, struct nm_d
 			rcu_guard();
 			struct nm_child_array *array = rcu_dereference(dir_node->children);
 			if (array) {
-				if (index >= (u32)array->count || nm_child_frag(nm_entries(array)[index].hash) != frag) {
+				if (index >= (u32)array->count || nm_entries(array)[index].frag != frag) {
 					for (u32 i = 0; i < (u32)array->count; i++)
-						if (nm_child_frag(nm_entries(array)[i].hash) == frag) { index = i; break; }
+						if (nm_entries(array)[i].frag == frag) { index = i; break; }
 				}
 			}
 		}
@@ -344,7 +344,7 @@ static inline void nm_emit_virtual_children(struct dir_context *ctx, struct nm_d
 		if (array && id < (u32)array->count) {
 			struct nm_leaf *leaf = nm_entries(array)[id].leaf;
 			struct nm_rule *rule = nm_select_rule(leaf, fsuid);
-			cur_frag = nm_child_frag(nm_entries(array)[id].hash);
+			cur_frag = nm_entries(array)[id].frag;
 			has_more = true;
 			if (rule && !(rule->flags & NM_FLAG_WHITEOUT) && (!native_view || nm_rule_needs_readdir(leaf, rule))) {
 				name_len = leaf->child_len;
@@ -356,7 +356,7 @@ static inline void nm_emit_virtual_children(struct dir_context *ctx, struct nm_d
 					do_emit = true;
 				}
 			}
-			if (id + 1 < (u32)array->count) next_frag = nm_child_frag(nm_entries(array)[id + 1].hash);
+			if (id + 1 < (u32)array->count) next_frag = nm_entries(array)[id + 1].frag;
 		}
 		rcu_read_unlock();
 		if (!has_more) break;
@@ -1705,6 +1705,7 @@ static int nm_inject_child_locked(struct nm_dir_node *dir_node, struct nm_leaf *
     if (nm_find_leaf_in_dir(dir_node, name, name_len)) return -EEXIST;
     leaf->child_len = name_len;
     struct nm_child child = { .leaf = leaf, .hash = nm_name_hash(name, name_len) };
+    child.frag = nm_child_frag(child.hash);
     leaf->child_hash = (u16)child.hash;
 
     if (!(array = nm_alloc_child_array(count + 1))) return -ENOMEM;

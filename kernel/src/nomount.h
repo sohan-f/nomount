@@ -92,6 +92,7 @@ struct nm_inode_info {
 struct nm_child {
     struct nm_leaf *leaf;
     u32 hash;
+    u16 frag;
 };
 
 struct nm_child_array {
