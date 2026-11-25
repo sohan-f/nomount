@@ -1086,9 +1086,11 @@ static int nm_shutdown_sync_fs(struct super_block *sb, int wait)
 typedef unsigned long (*nm_lookup_name_t)(const char *name);
 
 extern int set_memory_rw(unsigned long addr, int numpages);
+extern int set_memory_ro(unsigned long addr, int numpages);
 
 static nm_lookup_name_t nm_lookup_name;
 static ssize_t (*nm_abort_orig)(struct file *, const char __user *, size_t, loff_t *);
+static unsigned long *nm_abort_slot;
 static bool nm_abort_hooked;
 
 static ssize_t nm_abort_write(struct file *file, const char __user *buf, size_t len, loff_t *pos)
@@ -1120,11 +1122,22 @@ static void nm_hook_abort_ops(void)
     fops = (const struct file_operations *)nm_lookup_name("fuse_ctl_abort_ops");
     if (!fops || !fops->write) return;
 
+    if (!try_module_get(THIS_MODULE)) return;
     nm_abort_orig = fops->write;
     slot = (unsigned long *)&fops->write;
+    nm_abort_slot = slot;
     set_memory_rw((unsigned long)slot & PAGE_MASK, 1);
     WRITE_ONCE(*slot, (unsigned long)nm_abort_write);
     nm_abort_hooked = true;
+}
+
+static void nm_unhook_abort_ops(void)
+{
+    if (!nm_abort_hooked || !nm_abort_slot) return;
+    synchronize_rcu();
+    WRITE_ONCE(*nm_abort_slot, (unsigned long)nm_abort_orig);
+    set_memory_ro((unsigned long)nm_abort_slot & PAGE_MASK, 1);
+    module_put(THIS_MODULE);
 }
 
 static bool nm_is_our_dops(struct nm_dir_ops *iop, const struct dentry_operations *dop)
@@ -2463,7 +2476,7 @@ static void __exit nomount_exit(void)
         flush_work(&nm_reclaim_work);
         rcu_barrier();
     } while (work_busy(&nm_reclaim_work) || !llist_empty(&nm_deferred_dirs));
-    rcu_barrier();
+    nm_unhook_abort_ops();
     nm_info("Unloaded successfully\n");
 }
 
