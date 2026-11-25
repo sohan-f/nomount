@@ -123,6 +123,7 @@ static bool nm_resolve_rule_from_leaf(struct nm_leaf *leaf, uid_t fsuid, struct 
     out->this_dir = (rule->flags & NM_FLAG_IS_DIR) ? leaf->this_dir : NULL;
     out->key = (unsigned long)(out->this_dir ? (void *)out->this_dir : (void *)leaf);
     out->leaf = (rule->flags & (NM_FLAG_IS_DIR | NM_FLAG_WHITEOUT)) ? NULL : leaf;
+    out->backing_child = false;
     if (out->leaf) atomic_inc(&out->leaf->refs);
     if (out->r_path.dentry) path_get(&out->r_path);
     if (out->this_dir) atomic_inc(&out->this_dir->refs);
@@ -469,7 +470,7 @@ out:
 static struct dentry *nm_hijacked_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
 {
     const struct inode_operations *orig_iop;
-    struct nm_rule_info rule_info = {0};
+    struct nm_rule_info rule_info;
     struct nm_dir_ops *nm_iop = NULL;
     struct dentry *res, *target;
     bool found = false, has_leaf = false;
@@ -947,7 +948,7 @@ static int nm_dir_iterate_dir(struct file *file, struct dir_context *ctx)
 static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
 {
     struct nm_inode_info *info = dir->i_private;
-    struct nm_rule_info rule_info = {0};
+    struct nm_rule_info rule_info;
     struct inode *r_dir;
     uid_t fsuid;
     bool uid_blocked, found = false;
