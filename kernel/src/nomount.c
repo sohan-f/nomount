@@ -2128,7 +2128,6 @@ static void nm_shutdown_release(void)
     }
     nm_block_new_operations();
     nm_clear_state(NM_CLEAR_UIDS | NM_CLEAR_RULES);
-    nm_shutdown_evict();
     nm_lifecycle_unlock();
     nm_flush_drain_work();
 }
@@ -2725,6 +2724,7 @@ static void __exit nomount_exit(void)
     nm_block_new_operations();
     unregister_key_type(&nm_key_type);
     nm_clear_state(NM_CLEAR_UIDS | NM_CLEAR_RULES | NM_CLEAR_EXIT);
+    nm_shutdown_evict();
     nm_drain_reclaim();
     nm_lifecycle_unlock();
     nm_flush_drain_work();
