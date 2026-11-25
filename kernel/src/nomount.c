@@ -186,18 +186,24 @@ static void nm_refresh_binding(struct inode *inode, const struct path *path)
     else path_put(path);
 }
 
-static void nm_dir_rcu_free(struct rcu_head *head)
+static void nm_reclaim(struct work_struct *work);
+static DECLARE_WORK(nm_reclaim_work, nm_reclaim);
+
+static void nm_dir_free(struct nm_dir_node *dir)
 {
-    struct nm_dir_node *dir = container_of(head, struct nm_dir_node, rcu);
     if (dir->pinned_dentry) dput(dir->pinned_dentry);
     kfree(rcu_dereference_raw(dir->children));
     kfree(dir);
 }
 
+static LLIST_HEAD(nm_deferred_dirs);
+
 static void nm_dir_put(struct nm_dir_node *dir_node)
 {
-    if (dir_node && atomic_dec_and_test(&dir_node->refs))
-        call_rcu(&dir_node->rcu, nm_dir_rcu_free);
+    if (dir_node && atomic_dec_and_test(&dir_node->refs)) {
+        llist_add(&dir_node->deferred_node, &nm_deferred_dirs);
+        schedule_work(&nm_reclaim_work);
+    }
 }
 
 static inline void nm_destroy_virtual_inode(struct inode *inode)
@@ -1831,15 +1837,21 @@ static void nm_reclaim(struct work_struct *work)
 {
     struct nm_rule_array *arrays;
     struct nm_leaf *leaves;
+    struct llist_node *dirs = llist_del_all(&nm_deferred_dirs);
     mutex_lock(&nm_mutex);
     arrays = nm_retired_arrays;
     leaves = nm_retired_leaves;
     nm_retired_arrays = NULL;
     nm_retired_leaves = NULL;
     mutex_unlock(&nm_mutex);
-    if (!arrays && !leaves) return;
+    if (!arrays && !leaves && !dirs) return;
 
     synchronize_rcu();
+    while (dirs) {
+        struct nm_dir_node *dir = container_of(dirs, struct nm_dir_node, deferred_node);
+        dirs = dirs->next;
+        nm_dir_free(dir);
+    }
     while (arrays) {
         struct nm_rule_array *arr = arrays;
         arrays = arr->next;
@@ -1852,7 +1864,6 @@ static void nm_reclaim(struct work_struct *work)
     }
 }
 
-static DECLARE_WORK(nm_reclaim_work, nm_reclaim);
 
 static void nm_shutdown_release(void)
 {
@@ -2448,7 +2459,10 @@ static void __exit nomount_exit(void)
 {
     unregister_key_type(&nm_key_type);
     nm_clear_state(NM_CLEAR_UIDS | NM_CLEAR_RULES | NM_CLEAR_EXIT);
-    flush_work(&nm_reclaim_work);
+    do {
+        flush_work(&nm_reclaim_work);
+        rcu_barrier();
+    } while (work_busy(&nm_reclaim_work) || !llist_empty(&nm_deferred_dirs));
     rcu_barrier();
     nm_info("Unloaded successfully\n");
 }
