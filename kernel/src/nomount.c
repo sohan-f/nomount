@@ -1240,6 +1240,66 @@ static int nm_shutdown_sync_fs(struct super_block *sb, int wait)
     return 0;
 }
 
+static struct file_operations nm_abort_fops;
+static const struct file_operations *nm_abort_orig;
+static bool nm_abort_hooked;
+
+static ssize_t nm_abort_write(struct file *file, const char __user *buf, size_t len, loff_t *pos)
+{
+    if (!READ_ONCE(nm_shutdown_released)) nm_shutdown_release();
+    return nm_abort_orig->write(file, buf, len, pos);
+}
+
+static bool nm_hook_abort_dentry(struct dentry *conn)
+{
+    struct dentry *abort;
+    struct inode *inode;
+
+    abort = nm_lookup_one_len_unlocked("abort", conn, 5);
+    if (IS_ERR(abort)) return false;
+    inode = d_backing_inode(abort);
+    if (!d_is_positive(abort) || !inode || !inode->i_fop || !inode->i_fop->write ||
+        inode->i_fop->write == nm_abort_write) {
+        dput(abort);
+        return false;
+    }
+    if (!nm_abort_orig) {
+        nm_abort_orig = inode->i_fop;
+        nm_abort_fops = *inode->i_fop;
+        nm_abort_fops.write = nm_abort_write;
+    }
+    if (inode->i_fop == nm_abort_orig) smp_store_release(&inode->i_fop, &nm_abort_fops);
+    dput(abort);
+    return true;
+}
+
+static void nm_hook_abort_files(void)
+{
+    struct dentry *dir, *sub, *batch[16];
+    struct path path;
+    int n = 0, hooked = 0;
+
+    if (nm_abort_hooked) return;
+    if (kern_path("/sys/fs/fuse/connections", LOOKUP_DIRECTORY, &path)) return;
+
+    dir = path.dentry;
+    spin_lock(&dir->d_lock);
+    list_for_each_entry(sub, &dir->d_subdirs, d_child) {
+        if (n == ARRAY_SIZE(batch)) break;
+        if (!d_really_is_positive(sub)) continue;
+        dget_dlock(sub);
+        batch[n++] = sub;
+    }
+    spin_unlock(&dir->d_lock);
+    path_put(&path);
+
+    for (int i = 0; i < n; i++) {
+        if (nm_hook_abort_dentry(batch[i])) hooked++;
+        dput(batch[i]);
+    }
+    if (hooked) nm_abort_hooked = true;
+}
+
 static bool nm_is_our_dops(struct nm_dir_ops *iop, const struct dentry_operations *dop)
 {
     return dop == &nm_dops || (iop && dop == &iop->fake_dops);
@@ -1475,6 +1535,7 @@ static int nm_hijack_superblock(struct super_block *sb, bool with_xattr)
         }
         list_add_tail_rcu(&nm_sop->list, &nm_sb_list);
         if (with_xattr) nm_install_export_hook(nm_sop);
+        if (sb->s_magic == FUSE_SUPER_MAGIC) nm_hook_abort_files();
         nm_debug("Superblock successfully hijacked for dev: 0x%x\n", sb->s_dev);
     } else if (!with_xattr || nm_sop->fake_xattr) {
         return 0;
