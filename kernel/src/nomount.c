@@ -5,6 +5,7 @@
 #include <linux/cred.h>
 #include <linux/xattr.h>
 #include <linux/module.h>
+#include <linux/kprobes.h>
 #include "nomount.h"
 
 /*** Helpers ***/
@@ -1056,6 +1057,8 @@ static int nm_encode_fh(struct inode *inode, __u32 *fh, int *max_len, struct ino
     return nm_sop->orig_export_op->encode_fh(inode, fh, max_len, parent);
 }
 
+static void nm_shutdown_cycle(void);
+
 static int nm_shutdown_sync_fs(struct super_block *sb, int wait)
 {
     const struct super_operations *orig_sop;
@@ -1068,70 +1071,54 @@ static int nm_shutdown_sync_fs(struct super_block *sb, int wait)
         orig_sop = NULL;
     rcu_read_unlock();
 
-    if (current->pid == 1) nm_shutdown_release();
+    if (current->pid == 1 || !READ_ONCE(sb->s_root)) nm_shutdown_cycle();
     if (orig_sop && orig_sop->sync_fs)
         return orig_sop->sync_fs(sb, wait);
     return 0;
 }
 
-static struct file_operations nm_abort_fops;
-static const struct file_operations *nm_abort_orig;
+typedef unsigned long (*nm_lookup_name_t)(const char *name);
+
+extern int set_memory_rw(unsigned long addr, int numpages);
+
+static nm_lookup_name_t nm_lookup_name;
+static ssize_t (*nm_abort_orig)(struct file *, const char __user *, size_t, loff_t *);
 static bool nm_abort_hooked;
 
 static ssize_t nm_abort_write(struct file *file, const char __user *buf, size_t len, loff_t *pos)
 {
-    if (!READ_ONCE(nm_shutdown_released)) nm_shutdown_release();
-    return nm_abort_orig->write(file, buf, len, pos);
+    ssize_t ret = nm_abort_orig(file, buf, len, pos);
+
+    if (ret > 0) nm_shutdown_cycle();
+    return ret;
 }
 
-static bool nm_hook_abort_dentry(struct dentry *conn)
+static nm_lookup_name_t nm_resolve_lookup_name(void)
 {
-    struct dentry *abort;
-    struct inode *inode;
+    struct kprobe kp = { .symbol_name = "kallsyms_lookup_name" };
+    nm_lookup_name_t fn;
 
-    abort = nm_lookup_one_len_unlocked("abort", conn, 5);
-    if (IS_ERR(abort)) return false;
-    inode = d_backing_inode(abort);
-    if (!d_is_positive(abort) || !inode || !inode->i_fop || !inode->i_fop->write ||
-        inode->i_fop->write == nm_abort_write) {
-        dput(abort);
-        return false;
-    }
-    if (!nm_abort_orig) {
-        nm_abort_orig = inode->i_fop;
-        nm_abort_fops = *inode->i_fop;
-        nm_abort_fops.write = nm_abort_write;
-    }
-    if (inode->i_fop == nm_abort_orig) smp_store_release(&inode->i_fop, &nm_abort_fops);
-    dput(abort);
-    return true;
+    if (register_kprobe(&kp)) return NULL;
+    fn = (nm_lookup_name_t)kp.addr;
+    unregister_kprobe(&kp);
+    return fn;
 }
 
-static void nm_hook_abort_files(void)
+static void nm_hook_abort_ops(void)
 {
-    struct dentry *dir, *sub, *batch[16];
-    struct path path;
-    int n = 0, hooked = 0;
+    const struct file_operations *fops;
+    unsigned long *slot;
 
     if (nm_abort_hooked) return;
-    if (kern_path("/sys/fs/fuse/connections", LOOKUP_DIRECTORY, &path)) return;
+    if (!nm_lookup_name && !(nm_lookup_name = nm_resolve_lookup_name())) return;
+    fops = (const struct file_operations *)nm_lookup_name("fuse_ctl_abort_ops");
+    if (!fops || !fops->write) return;
 
-    dir = path.dentry;
-    spin_lock(&dir->d_lock);
-    list_for_each_entry(sub, &dir->d_subdirs, d_child) {
-        if (n == ARRAY_SIZE(batch)) break;
-        if (!d_really_is_positive(sub)) continue;
-        dget_dlock(sub);
-        batch[n++] = sub;
-    }
-    spin_unlock(&dir->d_lock);
-    path_put(&path);
-
-    for (int i = 0; i < n; i++) {
-        if (nm_hook_abort_dentry(batch[i])) hooked++;
-        dput(batch[i]);
-    }
-    if (hooked) nm_abort_hooked = true;
+    nm_abort_orig = fops->write;
+    slot = (unsigned long *)&fops->write;
+    set_memory_rw((unsigned long)slot & PAGE_MASK, 1);
+    WRITE_ONCE(*slot, (unsigned long)nm_abort_write);
+    nm_abort_hooked = true;
 }
 
 static bool nm_is_our_dops(struct nm_dir_ops *iop, const struct dentry_operations *dop)
@@ -1334,7 +1321,7 @@ static int nm_hijack_superblock(struct super_block *sb, bool with_xattr)
             if (with_xattr) nm_install_export_hook(nm_sop);
         }
         list_add_tail_rcu(&nm_sop->list, &nm_sb_list);
-        if (sb->s_magic == FUSE_SUPER_MAGIC) nm_hook_abort_files();
+        if (sb->s_magic == FUSE_SUPER_MAGIC) nm_hook_abort_ops();
         nm_debug("Superblock successfully hijacked for dev: 0x%x\n", sb->s_dev);
     } else if (!with_xattr || nm_sop->fake_xattr) {
         return 0;
@@ -1628,6 +1615,7 @@ static void nm_publish_child_view_locked(struct nm_dir_node *dir_node, struct nm
         if (dir_node->pinned_dentry) {
             struct dentry *pinned = dir_node->pinned_dentry;
             dir_node->pinned_dentry = NULL;
+            d_drop(pinned);
             dput(pinned);
         }
     }
@@ -1872,6 +1860,12 @@ static void nm_shutdown_release(void)
     WRITE_ONCE(nm_shutdown_released, true);
     nm_clear_state(NM_CLEAR_UIDS | NM_CLEAR_RULES);
     flush_work(&nm_reclaim_work);
+}
+
+static void nm_shutdown_cycle(void)
+{
+    nm_shutdown_release();
+    WRITE_ONCE(nm_shutdown_released, false);
 }
 
 static struct nm_rule_array nm_virtual_parent_rules = {
