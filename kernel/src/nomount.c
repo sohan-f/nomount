@@ -11,6 +11,7 @@
 /*** Helpers ***/
 
 static bool nm_shutdown_released;
+static u32 nm_rule_gen;
 static bool nm_block_isolated_uids = false;
 static __always_inline bool nm_is_uid_blocked_rcu(uid_t target_uid)
 {
@@ -1181,15 +1182,28 @@ static int nm_d_revalidate_common(struct inode *parent_inode, const struct qstr 
                            bound->dir_node ? smp_load_acquire(&bound->dir_node->owner) : NULL;
     if (!leaf || leaf->parent_dir != parent_dir || !nm_child_matches(leaf, name->name, name->len) || !rcu_access_pointer(leaf->rules))
         leaf = nm_find_leaf_in_dir(parent_dir, name->name, name->len);
-    if (leaf && !(uid_blocked = nm_is_uid_blocked_rcu(fsuid = current_fsuid().val)) && (rule = nm_select_rule(leaf, fsuid))) {
-        has_rule = true;
-        if (rule->flags & NM_FLAG_WHITEOUT)
-            whiteout = true;
-        else if (inode && nm_inode_is_virtual(inode)) {
-            if (rule->flags & NM_FLAG_IS_DIR)
-                match_rule = nm_inode_matches_binding(inode, &rule->r_path, leaf->this_dir, rule->flags & NM_FLAG_OPAQUE);
-            else
-                match_rule = nm_binding_matches_rule(inode, rule);
+    if (leaf && !(uid_blocked = nm_is_uid_blocked_rcu(fsuid = current_fsuid().val))) {
+        u32 gen = READ_ONCE(nm_rule_gen);
+
+        if (bound && bound->bound_gen == gen && bound->bound_uid == fsuid) {
+            struct dentry *pinned = READ_ONCE(bound->r_path.dentry);
+            struct inode *ri = pinned ? d_backing_inode(pinned) : NULL;
+            match_rule = likely(ri && ri->i_nlink && nm_inode_matches_attrs(inode, ri));
+        }
+        if (!match_rule && (rule = nm_select_rule(leaf, fsuid))) {
+            has_rule = true;
+            if (rule->flags & NM_FLAG_WHITEOUT)
+                whiteout = true;
+            else if (inode && nm_inode_is_virtual(inode)) {
+                if (rule->flags & NM_FLAG_IS_DIR)
+                    match_rule = nm_inode_matches_binding(inode, &rule->r_path, leaf->this_dir, rule->flags & NM_FLAG_OPAQUE);
+                else
+                    match_rule = nm_binding_matches_rule(inode, rule);
+            }
+        }
+        if (match_rule && bound) {
+            WRITE_ONCE(bound->bound_uid, fsuid);
+            WRITE_ONCE(bound->bound_gen, gen);
         }
     }
 
@@ -1924,6 +1938,7 @@ static void nm_publish_rules_locked(struct nm_leaf *leaf, struct nm_rule_array *
     bool before = nm_rules_need_readdir(leaf, old);
     bool after = nm_rules_need_readdir(leaf, array);
 
+    WRITE_ONCE(nm_rule_gen, nm_rule_gen + 1);
     if (parent && !before && after) WRITE_ONCE(parent->readdir_count, parent->readdir_count + 1);
     rcu_assign_pointer(leaf->rules, array);
     if (parent && before && !after) WRITE_ONCE(parent->readdir_count, parent->readdir_count - 1);
@@ -1933,6 +1948,7 @@ static void nm_publish_rules_locked(struct nm_leaf *leaf, struct nm_rule_array *
 static void nm_retire_leaf_locked(struct nm_leaf *leaf)
 {
     struct nm_rule_array *array = rcu_dereference_protected(leaf->rules, lockdep_is_held(&nm_mutex));
+    WRITE_ONCE(nm_rule_gen, nm_rule_gen + 1);
     if (leaf->this_dir) WRITE_ONCE(leaf->this_dir->owner, NULL);
     RCU_INIT_POINTER(leaf->rules, NULL);
     leaf->next = nm_retired_leaves;

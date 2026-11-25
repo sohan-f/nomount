@@ -81,6 +81,8 @@ struct nm_inode_info {
     struct path r_path;
     union { struct nm_dir_node *dir_node; struct nm_leaf *leaf; const void *node; };
     struct file *r_file;
+    u32 bound_gen;
+    u32 bound_uid;
     bool opaque;
     bool backing_child;
     struct rcu_head rcu;
