@@ -1201,6 +1201,13 @@ static int nm_d_revalidate_common(struct inode *parent_inode, const struct qstr 
     if (!has_rule && inode && nm_inode_is_virtual(inode)) {
         struct nm_inode_info *info = READ_ONCE(inode->i_private);
         if (info && info->backing_child) {
+            struct dentry *pinned = READ_ONCE(info->r_path.dentry);
+            struct inode *ri;
+
+            if (likely(pinned && !d_unlinked(pinned) && (ri = d_backing_inode(pinned)) &&
+                       nm_inode_matches_attrs(inode, ri)))
+                return 1;
+
             struct nm_inode_info *pinfo;
             struct dentry *backing, *backing_parent;
             bool valid;
